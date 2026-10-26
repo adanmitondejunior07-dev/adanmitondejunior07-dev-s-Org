@@ -1,0 +1,3147 @@
+import { supabase, ADMIN_EMAIL } from './supabase';
+import { idbStorage } from './idbStorage';
+import { 
+  Publication, 
+  Artisan, 
+  MarketplaceItem, 
+  VideoItem, 
+  ChatMessage, 
+  Conversation, 
+  AppNotification, 
+  ProblemReport, 
+  CommentItem,
+  UserProfile,
+  ArtisanVerificationRequest,
+  SubscriptionPaymentProof,
+  UserWallet,
+  WalletTransaction,
+  ServiceRequest,
+  MissionStatus,
+  PlatformSettings,
+  PaymentProvider,
+  InterventionType
+} from '../types';
+
+// ZERO DEMO DATA - ONLY REAL DATA FROM DATABASE AND REGISTERED USERS
+const INITIAL_ARTISANS: Artisan[] = [];
+const INITIAL_PUBLICATIONS: Publication[] = [];
+const INITIAL_MARKETPLACE: MarketplaceItem[] = [];
+const INITIAL_VIDEOS: VideoItem[] = [];
+
+class DataStoreService {
+  private memoryCache: Record<string, any> = {};
+  private hydrationPromise: Promise<void> | null = null;
+  private inFlightPublicationsPromise: Promise<Publication[]> | null = null;
+
+  constructor() {
+    this.hydrationPromise = this.hydrateFromIndexedDB();
+  }
+
+  async ensureHydrated(): Promise<void> {
+    if (!this.hydrationPromise) {
+      this.hydrationPromise = this.hydrateFromIndexedDB();
+    }
+    return this.hydrationPromise;
+  }
+
+  private async hydrateFromIndexedDB() {
+    const keys = [
+      'custom_publications', 
+      'custom_videos', 
+      'custom_marketplace', 
+      'custom_artisans', 
+      'my_likes',
+      'deleted_publications_ids',
+      'deleted_videos_ids',
+      'deleted_marketplace_ids',
+      'deleted_artisans_ids',
+      'wallets',
+      'wallet_transactions',
+      'service_requests',
+      'platform_settings',
+      'registered_users'
+    ];
+
+    // 1. Load persisted data from IndexedDB into memoryCache
+    for (const k of keys) {
+      try {
+        const val = await idbStorage.getItem(this.localKey(k));
+        if (val !== null && val !== undefined) {
+          this.memoryCache[this.localKey(k)] = val;
+        }
+      } catch {}
+    }
+
+    // 2. Proactive quota recovery: If bulky media/data exist in localStorage from previous versions,
+    // ensure they are safely preserved in idbStorage, then remove them from localStorage
+    // to guarantee maximum free storage space for Supabase Auth tokens on Android Chrome / iOS.
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const heavyPrefixes = [
+          'artisanpro_custom_videos',
+          'artisanpro_custom_publications',
+          'artisanpro_custom_marketplace',
+          'artisanpro_msgs_',
+          'artisanpro_convs_',
+          'artisanpro_admin_reports',
+          'artisanpro_subscription_proofs',
+          'artisanpro_service_requests'
+        ];
+
+        const keysToClean: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && heavyPrefixes.some(prefix => k.startsWith(prefix))) {
+            keysToClean.push(k);
+          }
+        }
+
+        for (const k of keysToClean) {
+          try {
+            const raw = localStorage.getItem(k);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (this.memoryCache[k] === undefined) {
+                this.memoryCache[k] = parsed;
+              }
+              // Save to IndexedDB if not already there
+              idbStorage.setItem(k, parsed).catch(() => {});
+            }
+            localStorage.removeItem(k);
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // Les méthodes de purge agressive (cleanUpKonanTest et purgeDemoFollowersAndLikes) ont été
+  // neutralisées pour protéger l'intégrité des comptes légitimes et des compteurs réels.
+  private purgeDemoFollowersAndLikes() {
+    // Désactivé : conservation de tous les compteurs réels sans remise à zéro arbitraire
+  }
+
+  private cleanUpKonanTest() {
+    // Désactivé : protection des utilisateurs légitimes portant le patronyme Konan
+  }
+
+  private localKey(key: string) {
+    return `artisanpro_${key}`;
+  }
+
+  getStored<T>(key: string, defaultVal: T): T {
+    const fullKey = this.localKey(key);
+    if (this.memoryCache[fullKey] !== undefined) {
+      return this.memoryCache[fullKey];
+    }
+    try {
+      const item = localStorage.getItem(fullKey);
+      if (item) {
+        const parsed = JSON.parse(item);
+        this.memoryCache[fullKey] = parsed;
+        return parsed;
+      }
+    } catch {}
+    return defaultVal;
+  }
+
+  setStored<T>(key: string, value: T): void {
+    const fullKey = this.localKey(key);
+    this.memoryCache[fullKey] = value;
+    // Always persist to IndexedDB asynchronously (handles large video data URLs without 5MB quota errors)
+    idbStorage.setItem(fullKey, value).catch(() => {});
+
+    // Bulky keys that typically contain base64 images or videos are NEVER written to localStorage.
+    // They are preserved in memoryCache and IndexedDB, keeping localStorage 100% available for Supabase Auth.
+    const isHeavyKey = 
+      key.startsWith('custom_') || 
+      key.startsWith('msgs_') || 
+      key.startsWith('convs_') ||
+      key.startsWith('admin_reports') ||
+      key.startsWith('subscription_proofs') ||
+      key.startsWith('service_requests') ||
+      key === 'registered_users';
+
+    if (isHeavyKey) {
+      try {
+        localStorage.removeItem(fullKey);
+      } catch {}
+      return;
+    }
+
+    try {
+      const serialized = JSON.stringify(value);
+      // Skip localStorage if payload is larger than 5 KB to guarantee free space for Supabase Auth
+      if (serialized.length > 5000) {
+        try { localStorage.removeItem(fullKey); } catch {}
+        return;
+      }
+      localStorage.setItem(fullKey, serialized);
+    } catch (e) {
+      console.warn('LocalStorage quota reached (safely stored in IndexedDB):', e);
+    }
+  }
+
+  resolveUserUuid(userId?: string | null): string | null {
+    if (!userId) return null;
+    const clean = userId.trim();
+    if (clean === 'admin-adanmitondejunior07') {
+      return '29a23578-640c-434c-bb7c-5b1cb7a30a91';
+    }
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean);
+    if (isUuid) return clean;
+    const reg = this.getStored<UserProfile[]>('registered_users', []);
+    const found = reg.find(u => u.id === clean || (u.email && u.email.toLowerCase() === clean.toLowerCase()));
+    if (found && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(found.id)) {
+      return found.id;
+    }
+    return null;
+  }
+
+  // PUBLICATIONS (POSTS) - ACCÈS SYNCHRONE IMMÉDIAT AU CACHE (0 ms)
+  getCachedPublicationsSync(currentUserId?: string): Publication[] {
+    const resolvedUserId = this.resolveUserUuid(currentUserId);
+    const localCached = this.getStored<Publication[]>('custom_publications', []);
+    const deletedIds = this.getStored<string[]>('deleted_publications_ids', []);
+    const userLikesKey = resolvedUserId ? `my_likes_${resolvedUserId}` : (currentUserId ? `my_likes_${currentUserId}` : null);
+    const localLikes = userLikesKey ? this.getStored<string[]>(userLikesKey, []) : [];
+
+    const seen = new Set<string>();
+    const deduped: Publication[] = [];
+    for (const p of localCached) {
+      if (!seen.has(p.id) && !deletedIds.includes(p.id)) {
+        seen.add(p.id);
+        const count = this.getStored<number>(`post_likes_${p.id}`, p.likes_count ?? 0);
+        const isLiked = resolvedUserId ? localLikes.includes(p.id) : false;
+        deduped.push({
+          ...p,
+          likes_count: count,
+          is_liked_by_me: isLiked
+        });
+      }
+    }
+    return deduped;
+  }
+
+  // PUBLICATIONS (POSTS) - ACTUALISATION PARALLÈLE & RÉSISTANTE AUX LENTEURS RÉSEAU
+  async getPublications(currentUserId?: string): Promise<Publication[]> {
+    // 1. Dédoublonnage : si une requête identique est déjà en cours, partager la promesse
+    if (this.inFlightPublicationsPromise) {
+      return this.inFlightPublicationsPromise;
+    }
+
+    this.inFlightPublicationsPromise = (async () => {
+      await this.ensureHydrated();
+      const resolvedUserId = this.resolveUserUuid(currentUserId);
+      const localCached = this.getStored<Publication[]>('custom_publications', []);
+      const deletedIds = this.getStored<string[]>('deleted_publications_ids', []);
+      const userLikesKey = resolvedUserId ? `my_likes_${resolvedUserId}` : (currentUserId ? `my_likes_${currentUserId}` : null);
+      const localLikes = userLikesKey ? this.getStored<string[]>(userLikesKey, []) : [];
+
+      try {
+        // 2. Parallélisation stricte des requêtes indépendantes avec timeout de sécurité de 4.5s
+        const fetchPromise = Promise.all([
+          supabase
+            .from('publications')
+            .select('*')
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('likes')
+            .select('post_id, user_id')
+        ]);
+
+        const timeoutPromise = new Promise<{ isTimeout: true }>((resolve) =>
+          setTimeout(() => resolve({ isTimeout: true }), 2500)
+        );
+
+        const raceResult = await Promise.race([fetchPromise, timeoutPromise]);
+
+        let pubData: any[] | null = null;
+        let pubError: any = null;
+        let likesData: any[] | null = null;
+        let likesError: any = null;
+
+        if ('isTimeout' in raceResult && raceResult.isTimeout) {
+          console.warn('Supabase getPublications délai dépassé (4.5s), utilisation sécurisée du cache local.');
+        } else {
+          const [resPub, resLikes] = raceResult as [any, any];
+          pubData = resPub.data;
+          pubError = resPub.error;
+          likesData = resLikes.data;
+          likesError = resLikes.error;
+        }
+
+        // 3. Traitement optimisé des mentions J'aime
+        const likesCountMap = new Map<string, number>();
+        const userLikedSet = new Set<string>();
+        const likesFetchedOk = !likesError && Array.isArray(likesData);
+
+        if (likesFetchedOk) {
+          for (const l of likesData!) {
+            if (l.post_id) {
+              likesCountMap.set(l.post_id, (likesCountMap.get(l.post_id) || 0) + 1);
+              if (resolvedUserId && l.user_id === resolvedUserId) {
+                userLikedSet.add(l.post_id);
+              }
+            }
+          }
+          if (resolvedUserId && userLikesKey) {
+            // Fusionner les likes locaux pour éviter tout effacement intempestif
+            localLikes.forEach(id => userLikedSet.add(id));
+            this.setStored(userLikesKey, Array.from(userLikedSet));
+          }
+        }
+
+        // 4. Fusion prioritaire : les publications Supabase enrichissent le cache local
+        let allPubs: Publication[] = [];
+        if (!pubError && pubData && pubData.length > 0) {
+          const supaPubs: Publication[] = pubData.map(row => {
+            const count = likesFetchedOk
+              ? (likesCountMap.get(row.id) ?? 0)
+              : this.getStored<number>(`post_likes_${row.id}`, 0);
+
+            const isLiked = resolvedUserId
+              ? (userLikedSet.has(row.id) || localLikes.includes(row.id))
+              : false;
+
+            if (likesFetchedOk) {
+              this.setStored(`post_likes_${row.id}`, count);
+            }
+
+            return {
+              id: row.id,
+              artisan_name: row.artisan_name || 'Artisan Anonyme',
+              artisan_avatar: row.artisan_avatar || null,
+              location: row.location || 'Afrique',
+              content: row.content || '',
+              media_url: row.media_url || null,
+              media_type: row.media_type || 'image',
+              created_at: row.created_at,
+              likes_count: count,
+              comments_count: 0,
+              is_liked_by_me: isLiked
+            };
+          });
+
+          allPubs = [...supaPubs, ...localCached, ...INITIAL_PUBLICATIONS];
+        } else {
+          // En cas d'erreur ou de réseau lent, NE JAMAIS vider la liste : servir le cache local
+          allPubs = [...localCached, ...INITIAL_PUBLICATIONS];
+        }
+
+        // 5. Déduplication par ID et exclusion des publications supprimées
+        const seen = new Set<string>();
+        const deduped: Publication[] = [];
+        for (const p of allPubs) {
+          if (!seen.has(p.id) && !deletedIds.includes(p.id)) {
+            seen.add(p.id);
+            const realCount = likesFetchedOk
+              ? (likesCountMap.has(p.id) ? likesCountMap.get(p.id)! : 0)
+              : this.getStored<number>(`post_likes_${p.id}`, p.likes_count ?? 0);
+
+            const isLiked = resolvedUserId
+              ? Boolean(userLikedSet.has(p.id) || localLikes.includes(p.id))
+              : false;
+
+            const finalLikesCount = Math.max(realCount, isLiked ? 1 : 0);
+            const commentsCount = this.getStored<CommentItem[]>(`comments_${p.id}`, []).length || p.comments_count || 0;
+
+            deduped.push({
+              ...p,
+              likes_count: finalLikesCount,
+              comments_count: commentsCount,
+              is_liked_by_me: isLiked
+            });
+          }
+        }
+
+        // Persister le résultat dans custom_publications pour alimenter le cache synchrone
+        if (deduped.length > 0) {
+          this.setStored('custom_publications', deduped);
+        }
+
+        return deduped;
+      } catch (err) {
+        console.error('getPublications error, fallback local:', err);
+        return this.getCachedPublicationsSync(currentUserId);
+      } finally {
+        this.inFlightPublicationsPromise = null;
+      }
+    })();
+
+    return this.inFlightPublicationsPromise;
+  }
+
+  async createPublication(pub: Omit<Publication, 'id' | 'created_at'>): Promise<Publication> {
+    const generatedUuid = typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : '00000000-0000-4000-8000-' + Math.random().toString(16).substring(2, 14).padEnd(12, '0');
+
+    const newPub: Publication = {
+      ...pub,
+      id: generatedUuid,
+      created_at: new Date().toISOString(),
+      likes_count: 0,
+      comments_count: 0,
+      is_liked_by_me: false
+    };
+
+    // Try inserting into Supabase publications table (if not a huge base64 payload)
+    if (!pub.media_url || !pub.media_url.startsWith('data:')) {
+      try {
+        const { data, error } = await supabase.from('publications').insert({
+          id: generatedUuid,
+          artisan_name: pub.artisan_name,
+          artisan_avatar: pub.artisan_avatar || null,
+          location: pub.location || null,
+          content: pub.content,
+          media_url: pub.media_url || null,
+          media_type: pub.media_type || 'image'
+        }).select().single();
+
+        if (!error && data) {
+          newPub.id = data.id;
+          newPub.created_at = data.created_at;
+        }
+      } catch (e) {
+        console.warn('Supabase publication insert error, fallback local:', e);
+      }
+    }
+
+    const current = this.getStored<Publication[]>('custom_publications', []);
+    this.setStored('custom_publications', [newPub, ...current]);
+
+    // Mirror video publications into custom_videos so they appear in Video Reels as well
+    if (pub.media_type === 'video' && pub.media_url) {
+      const curVids = this.getStored<VideoItem[]>('custom_videos', []);
+      const newVid: VideoItem = {
+        id: newPub.id,
+        title: pub.content ? pub.content.slice(0, 80) : 'Vidéo de réalisation artisanale',
+        video_url: pub.media_url,
+        artisan_name: pub.artisan_name,
+        artisan_avatar: pub.artisan_avatar || undefined,
+        metier: 'Artisan',
+        ville: pub.location || 'Afrique',
+        likes_count: 0,
+        comments_count: 0,
+        created_at: newPub.created_at,
+        user_id: pub.user_id
+      };
+      this.setStored('custom_videos', [newVid, ...curVids]);
+    }
+
+    return newPub;
+  }
+
+  async updatePublication(postId: string, updates: Partial<Publication>): Promise<Publication | null> {
+    const current = this.getStored<Publication[]>('custom_publications', []);
+    const idx = current.findIndex(p => p.id === postId);
+    if (idx >= 0) {
+      current[idx] = { ...current[idx], ...updates };
+      this.setStored('custom_publications', current);
+
+      // Also update in custom_videos if mirrored
+      const vids = this.getStored<VideoItem[]>('custom_videos', []);
+      const vIdx = vids.findIndex(v => v.id === postId);
+      if (vIdx >= 0) {
+        if (updates.content) vids[vIdx].title = updates.content.slice(0, 80);
+        if (updates.media_url) vids[vIdx].video_url = updates.media_url;
+        this.setStored('custom_videos', vids);
+      }
+      return current[idx];
+    }
+    return null;
+  }
+
+  async updateUserPublicationsAuthor(authorId: string, newName: string, newAvatar?: string, oldName?: string): Promise<void> {
+    await this.ensureHydrated();
+    const canonicalId = this.resolveUserUuid(authorId) || authorId;
+    const cleanOld = (oldName || '').trim().toLowerCase();
+
+    // 1. Update in-memory and custom_publications
+    const pubs = this.getStored<Publication[]>('custom_publications', []);
+    let updatedAny = false;
+    const updatedPubs = pubs.map(p => {
+      const isAuthor = 
+        (p.user_id && (p.user_id === authorId || p.user_id === canonicalId)) ||
+        (cleanOld && p.artisan_name && p.artisan_name.trim().toLowerCase() === cleanOld) ||
+        (canonicalId === '29a23578-640c-434c-bb7c-5b1cb7a30a91' && (p.artisan_name?.includes('Adanmitonde') || cleanOld.includes('adanmitonde')));
+      if (isAuthor) {
+        updatedAny = true;
+        return {
+          ...p,
+          artisan_name: newName,
+          artisan_avatar: newAvatar || p.artisan_avatar
+        };
+      }
+      return p;
+    });
+    if (updatedAny) {
+      this.setStored('custom_publications', updatedPubs);
+    }
+
+    // 2. Also update in custom_videos
+    const vids = this.getStored<VideoItem[]>('custom_videos', []);
+    let vidsUpdated = false;
+    const updatedVids = vids.map(v => {
+      const isAuthor = 
+        (v.user_id && (v.user_id === authorId || v.user_id === canonicalId)) ||
+        (cleanOld && v.artisan_name && v.artisan_name.trim().toLowerCase() === cleanOld) ||
+        (canonicalId === '29a23578-640c-434c-bb7c-5b1cb7a30a91' && (v.artisan_name?.includes('Adanmitonde') || cleanOld.includes('adanmitonde')));
+      if (isAuthor) {
+        vidsUpdated = true;
+        return {
+          ...v,
+          artisan_name: newName,
+          artisan_avatar: newAvatar || v.artisan_avatar
+        };
+      }
+      return v;
+    });
+    if (vidsUpdated) {
+      this.setStored('custom_videos', updatedVids);
+    }
+
+    // 3. Update Supabase publications table (matching oldName or founder name)
+    try {
+      const updatePayload: any = { artisan_name: newName };
+      if (newAvatar) updatePayload.artisan_avatar = newAvatar;
+
+      if (oldName && oldName.trim() && oldName.trim() !== newName.trim()) {
+        await supabase.from('publications').update(updatePayload).eq('artisan_name', oldName.trim());
+      }
+      if (canonicalId === '29a23578-640c-434c-bb7c-5b1cb7a30a91') {
+        await supabase.from('publications').update(updatePayload).ilike('artisan_name', '%Adanmitonde%');
+      }
+    } catch (err) {
+      console.warn('Supabase update publications author note:', err);
+    }
+  }
+
+  async deletePublication(postId: string): Promise<boolean> {
+    try {
+      const current = this.getStored<Publication[]>('custom_publications', []);
+      this.setStored('custom_publications', current.filter(p => p.id !== postId));
+
+      const vids = this.getStored<VideoItem[]>('custom_videos', []);
+      this.setStored('custom_videos', vids.filter(v => v.id !== postId));
+
+      const deletedIds = this.getStored<string[]>('deleted_publications_ids', []);
+      if (!deletedIds.includes(postId)) {
+        this.setStored('deleted_publications_ids', [...deletedIds, postId]);
+      }
+
+      // Try Supabase delete
+      try {
+        await supabase.from('publications').delete().eq('id', postId);
+      } catch (err) {
+        // silent
+      }
+
+      return true;
+    } catch (e) {
+      console.warn('deletePublication error:', e);
+      return false;
+    }
+  }
+
+  async toggleLike(postId: string, userId?: string): Promise<{ isLiked: boolean; count: number }> {
+    const resolvedUserId = this.resolveUserUuid(userId);
+    const userLikesKey = resolvedUserId ? `my_likes_${resolvedUserId}` : (userId ? `my_likes_${userId}` : null);
+    const localLikes = userLikesKey ? this.getStored<string[]>(userLikesKey, []) : [];
+
+    const isPostUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(postId);
+    let isLiked = localLikes.includes(postId);
+    let updatedCount: number | null = null;
+
+    // Sync to Supabase likes table if user is authenticated with a valid UUID and post has valid UUID
+    if (resolvedUserId && isPostUuid) {
+      try {
+        // 1. Check if like already exists in public.likes for (postId, resolvedUserId)
+        const { data: existingLikes, error: searchErr } = await supabase
+          .from('likes')
+          .select('id')
+          .eq('post_id', postId)
+          .eq('user_id', resolvedUserId);
+
+        const alreadyLiked = !searchErr && existingLikes && existingLikes.length > 0;
+
+        if (alreadyLiked) {
+          // Action: UNLIKE -> Delete from Supabase public.likes
+          const { error: delErr } = await supabase
+            .from('likes')
+            .delete()
+            .eq('post_id', postId)
+            .eq('user_id', resolvedUserId);
+
+          if (!delErr) {
+            isLiked = false;
+          }
+        } else {
+          // Action: LIKE -> Insert into Supabase public.likes (preventing duplicates)
+          const { error: insErr } = await supabase
+            .from('likes')
+            .insert({
+              post_id: postId,
+              user_id: resolvedUserId
+            });
+
+          // If inserted successfully or duplicate caught by DB constraint (code 23505)
+          if (!insErr || (insErr as { code?: string }).code === '23505') {
+            isLiked = true;
+          }
+        }
+
+        // 2. Fetch exact real count of likes from Supabase
+        const { count, error: countErr } = await supabase
+          .from('likes')
+          .select('*', { count: 'exact', head: true })
+          .eq('post_id', postId);
+
+        if (!countErr && typeof count === 'number') {
+          updatedCount = count;
+        }
+      } catch (e) {
+        console.warn('Supabase like error, fallback local:', e);
+        isLiked = !isLiked;
+      }
+    } else {
+      isLiked = !isLiked;
+    }
+
+    const currentPostLikes = this.getStored<number>(`post_likes_${postId}`, 0);
+    const finalCount = updatedCount !== null
+      ? updatedCount
+      : (isLiked ? currentPostLikes + 1 : Math.max(0, currentPostLikes - 1));
+
+    const updated = isLiked 
+      ? Array.from(new Set([...localLikes, postId]))
+      : localLikes.filter(id => id !== postId);
+
+    if (userLikesKey) {
+      this.setStored(userLikesKey, updated);
+    }
+    this.setStored(`post_likes_${postId}`, finalCount);
+
+    // Also update custom_publications directly so publication likes NEVER disappear
+    const customPubs = this.getStored<Publication[]>('custom_publications', []);
+    const updatedCustomPubs = customPubs.map(p => p.id === postId ? { ...p, likes_count: finalCount, is_liked_by_me: isLiked } : p);
+    this.setStored('custom_publications', updatedCustomPubs);
+
+    return { isLiked, count: finalCount };
+  }
+
+  // VIDEO LIKES: RESOLVES REAL PUBLICATION ROW IN SUPABASE TO GUARANTEE FOREIGN KEY COMPLIANCE
+  async toggleVideoLike(videoId: string, userId?: string): Promise<{ isLiked: boolean; count: number; error?: string }> {
+    if (!userId) {
+      return { isLiked: false, count: 0, error: 'unauthenticated' };
+    }
+    await this.ensureHydrated();
+    const resolvedUserId = this.resolveUserUuid(userId);
+    const userLikesKey = resolvedUserId ? `my_likes_${resolvedUserId}` : `my_likes_${userId}`;
+    const localLikes = this.getStored<string[]>(userLikesKey, []);
+
+    // Determine target publication row in Supabase 'publications'
+    let targetPubId: string | null = null;
+    let isLiked = localLikes.includes(videoId);
+
+    const isVideoUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(videoId);
+
+    // 1. Check if videoId itself exists in Supabase publications
+    if (isVideoUuid) {
+      try {
+        const { data: pubMatch } = await supabase
+          .from('publications')
+          .select('id')
+          .eq('id', videoId)
+          .maybeSingle();
+        if (pubMatch?.id) {
+          targetPubId = pubMatch.id;
+        }
+      } catch (err) {
+        console.warn('Check pub by id note:', err);
+      }
+    }
+
+    // 2. If not found by direct ID, locate video from local stores or Supabase
+    if (!targetPubId) {
+      const allVideos = this.getStored<VideoItem[]>('custom_videos', []);
+      const matchedVid = allVideos.find(v => v.id === videoId);
+
+      if (matchedVid && matchedVid.video_url) {
+        try {
+          const { data: byUrl } = await supabase
+            .from('publications')
+            .select('id')
+            .eq('media_url', matchedVid.video_url)
+            .maybeSingle();
+
+          if (byUrl?.id) {
+            targetPubId = byUrl.id;
+          } else {
+            // Ensure mirrored row exists in publications so foreign key constraint succeeds
+            const newPubId = isVideoUuid
+              ? videoId
+              : (typeof crypto !== 'undefined' && crypto.randomUUID
+                  ? crypto.randomUUID()
+                  : '00000000-0000-4000-8000-' + Math.random().toString(16).substring(2, 14).padEnd(12, '0'));
+            const { error: insPubErr } = await supabase
+              .from('publications')
+              .insert({
+                id: newPubId,
+                artisan_name: matchedVid.artisan_name || 'Artisan Créateur',
+                artisan_avatar: matchedVid.artisan_avatar || null,
+                location: matchedVid.ville || 'Afrique',
+                content: matchedVid.title || 'Vidéo artisanale',
+                media_url: matchedVid.video_url,
+                media_type: 'video',
+                created_at: matchedVid.created_at || new Date().toISOString()
+              });
+            if (!insPubErr) {
+              targetPubId = newPubId;
+            }
+          }
+        } catch (e) {
+          console.warn('Error matching video to publication row:', e);
+        }
+      }
+    }
+
+    let updatedCount: number | null = null;
+
+    // 3. If a valid publication row was resolved and user is authenticated with UUID, interact with 'likes' table
+    if (targetPubId && resolvedUserId) {
+      try {
+        const { data: existingLike, error: findErr } = await supabase
+          .from('likes')
+          .select('id')
+          .eq('post_id', targetPubId)
+          .eq('user_id', resolvedUserId)
+          .maybeSingle();
+
+        const alreadyLiked = !findErr && Boolean(existingLike);
+
+        if (alreadyLiked) {
+          // Unlike
+          const { error: delErr } = await supabase
+            .from('likes')
+            .delete()
+            .eq('post_id', targetPubId)
+            .eq('user_id', resolvedUserId);
+
+          if (!delErr) {
+            isLiked = false;
+          }
+        } else {
+          // Like
+          const { error: insErr } = await supabase
+            .from('likes')
+            .insert({
+              post_id: targetPubId,
+              user_id: resolvedUserId
+            });
+
+          if (!insErr || (insErr as any).code === '23505') {
+            isLiked = true;
+          }
+        }
+
+        // Recalculate real count from Supabase
+        const { count, error: countErr } = await supabase
+          .from('likes')
+          .select('*', { count: 'exact', head: true })
+          .eq('post_id', targetPubId);
+
+        if (!countErr && typeof count === 'number') {
+          updatedCount = count;
+        }
+      } catch (err) {
+        console.warn('Error syncing video like with Supabase:', err);
+        isLiked = !isLiked;
+      }
+    } else {
+      isLiked = !isLiked;
+    }
+
+    const currentPostLikes = this.getStored<number>(`post_likes_${videoId}`, 0);
+    const finalCount = updatedCount !== null
+      ? updatedCount
+      : (isLiked ? currentPostLikes + 1 : Math.max(0, currentPostLikes - 1));
+
+    // Update local storage for both keys (videoId and targetPubId)
+    const updated = isLiked 
+      ? Array.from(new Set([...localLikes, videoId, ...(targetPubId ? [targetPubId] : [])]))
+      : localLikes.filter(id => id !== videoId && id !== targetPubId);
+
+    this.setStored(userLikesKey, updated);
+    this.setStored(`post_likes_${videoId}`, finalCount);
+    if (targetPubId && targetPubId !== videoId) {
+      this.setStored(`post_likes_${targetPubId}`, finalCount);
+    }
+
+    // Update video item in custom_videos
+    const customVideos = this.getStored<VideoItem[]>('custom_videos', []);
+    const updatedVids = customVideos.map(v => 
+      (v.id === videoId || (targetPubId && v.id === targetPubId))
+        ? { ...v, likes_count: finalCount, is_liked: isLiked }
+        : v
+    );
+    this.setStored('custom_videos', updatedVids);
+
+    return { isLiked, count: finalCount };
+  }
+
+  // TOTAL PUBLICATION LIKES FOR USER PROFILE COUNTER TABLE
+  async getUserPublicationLikesCount(userId: string, authorName?: string): Promise<number> {
+    try {
+      const pubs = await this.getPublications(userId);
+      const myPubs = pubs.filter(p => {
+        const matchId = userId && p.user_id && p.user_id === userId;
+        const matchName = authorName && p.artisan_name && p.artisan_name.toLowerCase().trim() === authorName.toLowerCase().trim();
+        return matchId || matchName;
+      });
+
+      if (myPubs.length > 0) {
+        return myPubs.reduce((sum, p) => sum + (p.likes_count || 0), 0);
+      }
+      return this.getUserLikesCount(userId);
+    } catch {
+      return this.getUserLikesCount(userId);
+    }
+  }
+
+  // ZERO DEMO BASELINE - REAL COUNTS ONLY (0 BY DEFAULT)
+  getUserFollowersCount(userId: string): number {
+    return this.getStored<number>(`followers_count_${userId}`, 0);
+  }
+
+  getUserLikesCount(userId: string): number {
+    return this.getStored<number>(`likes_count_${userId}`, 0);
+  }
+
+  getFollowedUsers(userId?: string): string[] {
+    if (!userId) return [];
+    const myId = this.resolveUserUuid(userId) || userId;
+    return this.getStored<string[]>(`following_${myId}`, []);
+  }
+
+  isUserFollowed(targetUserId: string, currentUserId?: string): boolean {
+    if (!currentUserId || !targetUserId || targetUserId === currentUserId) return false;
+    const myId = this.resolveUserUuid(currentUserId) || currentUserId;
+    const myFollows = this.getStored<string[]>(`following_${myId}`, []);
+    return myFollows.includes(targetUserId);
+  }
+
+  async syncFollowsWithDatabase(currentUserId: string): Promise<void> {
+    if (!currentUserId) return;
+    const myId = this.resolveUserUuid(currentUserId) || currentUserId;
+    try {
+      const { data: followRows } = await supabase
+        .from('user_follows')
+        .select('following_id')
+        .eq('follower_id', myId);
+
+      if (followRows && followRows.length > 0) {
+        const followingIds = followRows.map((r: any) => r.following_id);
+        const existing = this.getStored<string[]>(`following_${myId}`, []);
+        this.setStored(`following_${myId}`, Array.from(new Set([...existing, ...followingIds])));
+      }
+    } catch (e) {
+      // Table user_follows optional / local storage authoritative fallback
+    }
+  }
+
+  toggleFollowUser(targetUserId: string, currentUserId?: string): { isFollowed: boolean; followersCount: number } {
+    const myId = this.resolveUserUuid(currentUserId) || currentUserId || 'me';
+
+    // Règle : Un utilisateur ne peut pas s'abonner à lui-même
+    if (currentUserId && (targetUserId === currentUserId || targetUserId === myId)) {
+      return { isFollowed: false, followersCount: this.getUserFollowersCount(targetUserId) };
+    }
+
+    const myFollows = this.getStored<string[]>(`following_${myId}`, []);
+    const isFollowed = myFollows.includes(targetUserId);
+    
+    let followers = this.getUserFollowersCount(targetUserId);
+
+    if (isFollowed) {
+      this.setStored(`following_${myId}`, myFollows.filter(id => id !== targetUserId));
+      followers = Math.max(0, followers - 1);
+    } else {
+      this.setStored(`following_${myId}`, Array.from(new Set([...myFollows, targetUserId])));
+      followers = followers + 1;
+    }
+
+    this.setStored(`followers_count_${targetUserId}`, followers);
+
+    // Sync to Supabase user_follows table in background if available
+    if (myId && myId !== 'me' && targetUserId) {
+      (async () => {
+        try {
+          if (isFollowed) {
+            await supabase.from('user_follows').delete().eq('follower_id', myId).eq('following_id', targetUserId);
+          } else {
+            await supabase.from('user_follows').insert({ follower_id: myId, following_id: targetUserId });
+          }
+          // Fetch exact count via secure public RPC without exposing follower identities
+          try {
+            const { data: rpcCount, error: rpcErr } = await supabase.rpc('get_followers_count', { target_id: targetUserId });
+            if (!rpcErr && typeof rpcCount === 'number') {
+              this.setStored(`followers_count_${targetUserId}`, rpcCount);
+            } else {
+              const { count } = await supabase.from('user_follows').select('*', { count: 'exact', head: true }).eq('following_id', targetUserId);
+              if (typeof count === 'number') {
+                this.setStored(`followers_count_${targetUserId}`, count);
+              }
+            }
+          } catch {}
+        } catch (e) {
+          // Table doesn't exist yet in Supabase, local state is securely maintained
+        }
+      })();
+    }
+
+    return { isFollowed: !isFollowed, followersCount: followers };
+  }
+
+  isUserLiked(targetUserId: string, currentUserId?: string): boolean {
+    const myId = currentUserId || 'me';
+    const myUserLikes = this.getStored<string[]>(`user_likes_${myId}`, []);
+    return myUserLikes.includes(targetUserId);
+  }
+
+  toggleUserLike(targetUserId: string, currentUserId?: string): { isLiked: boolean; likesCount: number } {
+    const myId = currentUserId || 'me';
+    const myUserLikes = this.getStored<string[]>(`user_likes_${myId}`, []);
+    const isLiked = myUserLikes.includes(targetUserId);
+
+    let likes = this.getUserLikesCount(targetUserId);
+
+    if (isLiked) {
+      this.setStored(`user_likes_${myId}`, myUserLikes.filter(id => id !== targetUserId));
+      likes = Math.max(0, likes - 1);
+    } else {
+      this.setStored(`user_likes_${myId}`, [...myUserLikes, targetUserId]);
+      likes = likes + 1;
+    }
+
+    this.setStored(`likes_count_${targetUserId}`, likes);
+    return { isLiked: !isLiked, likesCount: likes };
+  }
+
+  // COMMENTS
+  async getComments(postId: string): Promise<CommentItem[]> {
+    try {
+      const { data, error } = await supabase
+        .from('comments')
+        .select('*')
+        .eq('post_id', postId)
+        .order('created_at', { ascending: true });
+
+      const localKey = `comments_${postId}`;
+      const localComments = this.getStored<CommentItem[]>(localKey, []);
+
+      if (!error && data && data.length > 0) {
+        const merged = [...data, ...localComments];
+        const seen = new Set<string>();
+        return merged.filter(c => {
+          if (seen.has(c.id)) return false;
+          seen.add(c.id);
+          return true;
+        });
+      }
+      return localComments;
+    } catch {
+      return this.getStored<CommentItem[]>(`comments_${postId}`, []);
+    }
+  }
+
+  async addComment(postId: string, userId: string, userName: string, text: string): Promise<CommentItem> {
+    const newComment: CommentItem = {
+      id: 'cmt-' + Date.now() + '-' + Math.random().toString(36).substring(2, 5),
+      post_id: postId,
+      user_id: userId,
+      user_name: userName,
+      comment_text: text,
+      created_at: new Date().toISOString()
+    };
+
+    try {
+      const { data, error } = await supabase.from('comments').insert({
+        post_id: postId,
+        user_id: userId,
+        user_name: userName,
+        comment_text: text
+      }).select().single();
+
+      if (!error && data) {
+        newComment.id = data.id;
+        newComment.created_at = data.created_at;
+      }
+    } catch (e) {
+      console.warn('Supabase comment insert failed, local fallback:', e);
+    }
+
+    const localKey = `comments_${postId}`;
+    const cur = this.getStored<CommentItem[]>(localKey, []);
+    this.setStored(localKey, [...cur, newComment]);
+    return newComment;
+  }
+
+  // REGISTERED USERS MANAGEMENT
+  // REGISTERED USERS MANAGEMENT
+  getRegisteredUsers(): UserProfile[] {
+    return this.getStored<UserProfile[]>('registered_users', []);
+  }
+
+  saveRegisteredUser(user: UserProfile): void {
+    const list = this.getRegisteredUsers();
+    const idx = list.findIndex(u => u.id === user.id || (u.email && user.email && u.email.toLowerCase() === user.email.toLowerCase()));
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...user };
+    } else {
+      list.push(user);
+    }
+    this.setStored('registered_users', list);
+  }
+
+  async deleteUser(userId: string): Promise<boolean> {
+    console.warn(`[SECURITE] Protection permanente active : Tentative de suppression du compte ${userId} neutralisée.`);
+    return false;
+  }
+
+  // ARTISANS - ONLY REAL REGISTERED ARTISANS
+  async getArtisans(): Promise<Artisan[]> {
+    await this.ensureHydrated();
+    try {
+      const deletedIds = this.getStored<string[]>('deleted_artisans_ids', []);
+      // Colonnes publiques explicites (exclusion stricte de solde, cni_recto_url, cni_verso_url, selfie_url, atelier_url, kyc_status, abonnement_paye, abonnement_date, abonnement_expire_at, embedding)
+      const PUBLIC_ARTISAN_COLUMNS = 'id, nom, telephone, whatsapp, metier, ville, commune, description, services, photos, tarif_min, verifie, badge_vert, note_moyenne, nombre_avis, disponible, is_verified, badge_bleu, is_fondateur, created_at';
+      
+      let data: any[] | null = null;
+      let error: any = null;
+
+      // 1. Interroger la vue sécurisée public_artisans (si déployée), sinon repli transparent sur artisans avec projection stricte
+      try {
+        const resView = await supabase.from('public_artisans').select(PUBLIC_ARTISAN_COLUMNS);
+        if (!resView.error && resView.data && resView.data.length > 0) {
+          data = resView.data;
+        } else {
+          const resTable = await supabase.from('artisans').select(PUBLIC_ARTISAN_COLUMNS);
+          data = resTable.data;
+          error = resTable.error;
+        }
+      } catch {
+        const resTable = await supabase.from('artisans').select(PUBLIC_ARTISAN_COLUMNS);
+        data = resTable.data;
+        error = resTable.error;
+      }
+
+      let merged: Artisan[] = [];
+
+      if (!error && data && data.length > 0) {
+        const formatted: Artisan[] = data.map(a => ({
+          id: a.id,
+          nom: a.nom || 'Artisan Partenaire',
+          telephone: a.telephone || a.whatsapp || '',
+          whatsapp: a.whatsapp || a.telephone || '',
+          metier: a.metier || 'Artisan',
+          ville: a.ville || 'Abidjan',
+          commune: a.commune || '',
+          description: a.description || 'Artisan qualifié inscrit sur la plateforme ArtisanPro.',
+          services: a.services || 'Prestations sur mesure',
+          tarif_min: a.tarif_min || 15000,
+          verifie: a.verifie ?? a.is_verified ?? false,
+          badge_vert: a.badge_vert ?? true,
+          badge_bleu: a.badge_bleu ?? false,
+          is_verified: a.is_verified ?? false,
+          is_fondateur: a.is_fondateur ?? false,
+          note_moyenne: a.note_moyenne || 5.0,
+          nombre_avis: a.nombre_avis || 0,
+          disponible: a.disponible ?? true,
+          photos: a.photos || [],
+          created_at: a.created_at || new Date().toISOString()
+        }));
+        merged = [...formatted];
+      }
+
+      // Include real registered artisans from profils table directly (without depending on restricted profiles table)
+      try {
+        const { data: profilsRows } = await supabase
+          .from('profils')
+          .select('id, nom_complet, metier, telephone, photo_profil, ville_pays');
+
+        if (profilsRows && profilsRows.length > 0) {
+          for (const p of profilsRows) {
+            const hasMetier = p.metier && p.metier !== 'Membre' && p.metier !== 'Nouvel Artisan';
+            const isFounder = p.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' || p.id === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb';
+            if (hasMetier || isFounder) {
+              if (!merged.some(m => m.id === p.id || (p.telephone && m.telephone && m.telephone.includes(p.telephone)))) {
+                merged.push({
+                  id: p.id,
+                  nom: (p.nom_complet && p.nom_complet !== 'Nouvel Artisan') ? p.nom_complet : (isFounder ? 'Junior Adanmitonde' : 'Artisan Partenaire'),
+                  telephone: p.telephone || '+225 00000000',
+                  whatsapp: p.telephone || '+225 00000000',
+                  metier: p.metier || 'Artisan',
+                  ville: (p.ville_pays && !p.ville_pays.includes('Afrique 🌍')) ? p.ville_pays.split(',')[0].trim() : 'Abidjan',
+                  description: isFounder ? 'Fondateur et administrateur de la plateforme ArtisanPro.' : 'Professionnel qualifié inscrit sur la plateforme ArtisanPro.',
+                  services: 'Prestations artisanales',
+                  tarif_min: 15000,
+                  verifie: isFounder,
+                  badge_bleu: isFounder,
+                  badge_vert: true,
+                  is_verified: isFounder,
+                  is_fondateur: isFounder,
+                  note_moyenne: 5.0,
+                  nombre_avis: 0,
+                  disponible: true,
+                  photos: p.photo_profil ? [p.photo_profil] : [],
+                  created_at: new Date().toISOString()
+                });
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // silent
+      }
+
+      // Include custom artisans added via UI
+      const customArtisans = this.getStored<Artisan[]>('custom_artisans', []);
+      for (const ca of customArtisans) {
+        if (!merged.some(m => m.id === ca.id)) {
+          merged.push(ca);
+        }
+      }
+
+      // Include locally registered artisans
+      const localUsers = this.getRegisteredUsers();
+      for (const u of localUsers) {
+        if (u.role === 'artisan' && !merged.some(m => m.id === u.id)) {
+          merged.push({
+            id: u.id,
+            nom: u.full_name || u.email.split('@')[0],
+            telephone: u.telephone || '',
+            whatsapp: u.telephone || '',
+            metier: u.metier || 'Artisan',
+            ville: u.ville || 'Abidjan',
+            description: u.bio || 'Professionnel inscrit sur ArtisanPro Afrique.',
+            services: 'Prestations sur mesure',
+            tarif_min: 15000,
+            verifie: u.is_verified || false,
+            badge_bleu: u.badge_bleu || false,
+            badge_vert: true,
+            is_verified: u.is_verified || false,
+            note_moyenne: 5.0,
+            nombre_avis: 0,
+            disponible: true,
+            photos: u.avatar_url ? [u.avatar_url] : [],
+            created_at: u.created_at || new Date().toISOString()
+          });
+        }
+      }
+
+      const seen = new Set<string>();
+      return merged.filter(a => {
+        if (seen.has(a.id)) return false;
+        seen.add(a.id);
+        return true;
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async addCustomArtisan(artisan: Omit<Artisan, 'id' | 'created_at'>): Promise<Artisan> {
+    const newArtisan: Artisan = {
+      ...artisan,
+      id: 'art-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      created_at: new Date().toISOString(),
+      verifie: true,
+      badge_vert: true,
+      badge_bleu: true,
+      note_moyenne: 5.0,
+      nombre_avis: 1,
+      disponible: true
+    };
+    const current = this.getStored<Artisan[]>('custom_artisans', []);
+    this.setStored('custom_artisans', [newArtisan, ...current]);
+    return newArtisan;
+  }
+
+  // MARKETPLACE
+  async getMarketplaceItems(): Promise<MarketplaceItem[]> {
+    await this.ensureHydrated();
+    const deletedIds = this.getStored<string[]>('deleted_marketplace_ids', []);
+    const custom = this.getStored<MarketplaceItem[]>('custom_marketplace', []);
+    return [...custom.filter(it => !deletedIds.includes(it.id)), ...INITIAL_MARKETPLACE.filter(it => !deletedIds.includes(it.id))];
+  }
+
+  async createMarketplaceItem(item: Omit<MarketplaceItem, 'id' | 'created_at'>): Promise<MarketplaceItem> {
+    await this.ensureHydrated();
+    const newItem: MarketplaceItem = {
+      ...item,
+      id: 'mkt-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      created_at: new Date().toISOString()
+    };
+    const current = this.getStored<MarketplaceItem[]>('custom_marketplace', []);
+    this.setStored('custom_marketplace', [newItem, ...current]);
+    return newItem;
+  }
+
+  async updateMarketplaceItem(itemId: string, updates: Partial<MarketplaceItem>): Promise<MarketplaceItem | null> {
+    await this.ensureHydrated();
+    const current = this.getStored<MarketplaceItem[]>('custom_marketplace', []);
+    const idx = current.findIndex(it => it.id === itemId);
+    if (idx >= 0) {
+      current[idx] = { ...current[idx], ...updates };
+      this.setStored('custom_marketplace', current);
+      return current[idx];
+    }
+    return null;
+  }
+
+  async deleteMarketplaceItem(itemId: string): Promise<boolean> {
+    await this.ensureHydrated();
+    const current = this.getStored<MarketplaceItem[]>('custom_marketplace', []);
+    this.setStored('custom_marketplace', current.filter(it => it.id !== itemId));
+    const deletedIds = this.getStored<string[]>('deleted_marketplace_ids', []);
+    if (!deletedIds.includes(itemId)) {
+      this.setStored('deleted_marketplace_ids', [...deletedIds, itemId]);
+    }
+    return true;
+  }
+
+  // VIDEOS
+  async getVideos(currentUserId?: string): Promise<VideoItem[]> {
+    await this.ensureHydrated();
+    const resolvedId = this.resolveUserUuid(currentUserId) || currentUserId;
+    const userLikesKey = resolvedId ? `my_likes_${resolvedId}` : null;
+    const localLikes = userLikesKey ? this.getStored<string[]>(userLikesKey, []) : [];
+
+    const deletedIds = this.getStored<string[]>('deleted_videos_ids', []);
+    const custom = this.getStored<VideoItem[]>('custom_videos', [])
+      .filter(v => v.video_url && !deletedIds.includes(v.id));
+
+    // Also fetch videos from Supabase publications table where media_type = 'video'
+    let supaVideos: VideoItem[] = [];
+    try {
+      const { data: supaPubs, error } = await supabase
+        .from('publications')
+        .select('*')
+        .eq('media_type', 'video')
+        .order('created_at', { ascending: false });
+
+      if (!error && supaPubs && supaPubs.length > 0) {
+        supaVideos = supaPubs
+          .filter(p => !deletedIds.includes(p.id))
+          .map(p => ({
+            id: p.id,
+            title: p.content || 'Réalisation artisanale en vidéo',
+            video_url: p.media_url,
+            poster_url: undefined,
+            artisan_name: p.artisan_name,
+            artisan_avatar: p.artisan_avatar || undefined,
+            metier: 'Artisan',
+            ville: p.location || 'Afrique',
+            likes_count: 0,
+            comments_count: 0,
+            created_at: p.created_at,
+            user_id: p.user_id
+          }));
+      }
+    } catch (e) {
+      console.warn('Supabase getVideos note:', e);
+    }
+
+    // Also pull in any local publication created with media_type === 'video'
+    const pubs = this.getStored<Publication[]>('custom_publications', []);
+    const pubVideos: VideoItem[] = pubs
+      .filter(p => p.media_type === 'video' && p.media_url && !deletedIds.includes(p.id))
+      .map(p => ({
+        id: p.id,
+        title: p.content ? (p.content.slice(0, 60)) : 'Réalisation artisanale en vidéo',
+        video_url: p.media_url!,
+        poster_url: undefined,
+        artisan_name: p.artisan_name,
+        artisan_avatar: p.artisan_avatar || undefined,
+        metier: 'Artisan',
+        ville: p.location || 'Afrique',
+        likes_count: p.likes_count || 0,
+        comments_count: p.comments_count || 0,
+        created_at: p.created_at,
+        user_id: p.user_id
+      }));
+
+    const all = [...supaVideos, ...custom, ...pubVideos, ...INITIAL_VIDEOS.filter(v => !deletedIds.includes(v.id))];
+    const seen = new Set<string>();
+    const uniqueVideos = all.filter(v => {
+      if (!v.id || seen.has(v.id)) return false;
+      seen.add(v.id);
+      return true;
+    });
+
+    // Check likes from Supabase for all videos that have a UUID
+    const supaLikesSet = new Set<string>();
+    const likesCountMap = new Map<string, number>();
+
+    const uuidVideos = uniqueVideos.filter(v => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.id));
+    if (uuidVideos.length > 0) {
+      try {
+        const videoIds = uuidVideos.map(v => v.id);
+        const { data: likesData, error: lkErr } = await supabase
+          .from('likes')
+          .select('post_id, user_id')
+          .in('post_id', videoIds);
+
+        if (!lkErr && likesData) {
+          likesData.forEach((row: { post_id: string; user_id: string }) => {
+            const currentC = likesCountMap.get(row.post_id) || 0;
+            likesCountMap.set(row.post_id, currentC + 1);
+            if (resolvedId && row.user_id === resolvedId) {
+              supaLikesSet.add(row.post_id);
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('Supabase likes fetch for videos note:', e);
+      }
+    }
+
+    return uniqueVideos.map(v => {
+      const isPostUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.id);
+      let isLiked = false;
+      let realCount = 0;
+
+      if (isPostUuid && resolvedId) {
+        isLiked = supaLikesSet.has(v.id);
+      } else if (resolvedId) {
+        isLiked = localLikes.includes(v.id);
+      } else {
+        isLiked = false;
+      }
+
+      if (isPostUuid && likesCountMap.has(v.id)) {
+        realCount = likesCountMap.get(v.id)!;
+      } else {
+        realCount = this.getStored<number>(`post_likes_${v.id}`, v.likes_count || 0);
+      }
+
+      return {
+        ...v,
+        likes_count: realCount,
+        is_liked: isLiked
+      };
+    });
+  }
+
+  async addVideo(video: Omit<VideoItem, 'id' | 'created_at' | 'likes_count' | 'comments_count'>): Promise<VideoItem> {
+    await this.ensureHydrated();
+    const videoUuid = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    const newVid: VideoItem = {
+      ...video,
+      id: videoUuid,
+      likes_count: 0,
+      comments_count: 0,
+      created_at: now
+    };
+    const current = this.getStored<VideoItem[]>('custom_videos', []);
+    this.setStored('custom_videos', [newVid, ...current]);
+
+    // Insert into Supabase publications table with media_type = 'video'
+    try {
+      await supabase.from('publications').insert({
+        id: videoUuid,
+        artisan_name: video.artisan_name,
+        artisan_avatar: video.artisan_avatar || null,
+        location: video.ville || 'Afrique',
+        content: video.title,
+        media_url: video.video_url,
+        media_type: 'video',
+        created_at: now
+      });
+    } catch (err) {
+      console.warn('Supabase video publication insert note:', err);
+    }
+
+    // Also mirror to custom_publications so it appears in the Social Feed
+    const pubs = this.getStored<Publication[]>('custom_publications', []);
+    const mirroredPub: Publication = {
+      id: videoUuid,
+      artisan_name: newVid.artisan_name,
+      artisan_avatar: newVid.artisan_avatar || null,
+      location: newVid.ville || 'Afrique',
+      content: newVid.title,
+      media_url: newVid.video_url,
+      media_type: 'video',
+      created_at: now,
+      user_id: newVid.user_id,
+      likes_count: 0,
+      comments_count: 0
+    };
+    this.setStored('custom_publications', [mirroredPub, ...pubs]);
+
+    return newVid;
+  }
+
+  async updateVideo(videoId: string, updates: Partial<VideoItem>): Promise<VideoItem | null> {
+    const current = this.getStored<VideoItem[]>('custom_videos', []);
+    const idx = current.findIndex(v => v.id === videoId);
+    if (idx >= 0) {
+      current[idx] = { ...current[idx], ...updates };
+      this.setStored('custom_videos', current);
+
+      // Also update publication if mirrored
+      const pubs = this.getStored<Publication[]>('custom_publications', []);
+      const pIdx = pubs.findIndex(p => p.id === videoId);
+      if (pIdx >= 0) {
+        if (updates.title) pubs[pIdx].content = updates.title;
+        if (updates.video_url) pubs[pIdx].media_url = updates.video_url;
+        this.setStored('custom_publications', pubs);
+      }
+      return current[idx];
+    }
+    return null;
+  }
+
+  async deleteVideo(videoId: string): Promise<boolean> {
+    try {
+      const current = this.getStored<VideoItem[]>('custom_videos', []);
+      this.setStored('custom_videos', current.filter(v => v.id !== videoId));
+      
+      const pubs = this.getStored<Publication[]>('custom_publications', []);
+      this.setStored('custom_publications', pubs.filter(p => p.id !== videoId));
+
+      const deletedIds = this.getStored<string[]>('deleted_videos_ids', []);
+      if (!deletedIds.includes(videoId)) {
+        this.setStored('deleted_videos_ids', [...deletedIds, videoId]);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async updateArtisan(artisanId: string, updates: Partial<Artisan>): Promise<Artisan | null> {
+    const current = this.getStored<Artisan[]>('custom_artisans', []);
+    const idx = current.findIndex(a => a.id === artisanId);
+    if (idx >= 0) {
+      current[idx] = { ...current[idx], ...updates };
+      this.setStored('custom_artisans', current);
+      return current[idx];
+    }
+    return null;
+  }
+
+  async deleteArtisan(artisanId: string): Promise<boolean> {
+    console.warn(`[SECURITE] Protection permanente active : Tentative de suppression de l'artisan ${artisanId} neutralisée.`);
+    return false;
+  }
+
+  // CHAT - CRITICAL: FIX BUG ENVOI DOUBLE - 1 SEUL INSERT GARANTI
+  private pendingMessageTokens = new Set<string>();
+
+  getCanonicalConversationId(user1Id: string, user2Id: string): string {
+    const c1 = this.resolveUserUuid(user1Id) || (user1Id || '').trim();
+    const c2 = this.resolveUserUuid(user2Id) || (user2Id || '').trim();
+    const sorted = [c1, c2].sort().join('_');
+    return `conv-${sorted}`;
+  }
+
+  async getConversations(myId: string): Promise<Conversation[]> {
+    const canonicalMyId = this.resolveUserUuid(myId) || myId;
+    const deletedConvIds = this.getStored<string[]>(`deleted_convs_${myId}`, []);
+    const directConvs = this.getStored<Conversation[]>(`convs_${myId}`, []);
+
+    // Also find any alias IDs (e.g. if myId is a user who is also an artisan, or an artisan ID)
+    const allUsers = await this.getAllUsers();
+    const allArtisans = await this.getArtisans();
+    const currentUser = allUsers.find(u => u.id === myId || u.id === canonicalMyId);
+
+    const aliasIds = new Set<string>([myId, canonicalMyId]);
+    if (myId === 'admin-adanmitondejunior07' || canonicalMyId === '29a23578-640c-434c-bb7c-5b1cb7a30a91') {
+      aliasIds.add('admin-adanmitondejunior07');
+      aliasIds.add('29a23578-640c-434c-bb7c-5b1cb7a30a91');
+    }
+    if (currentUser) {
+      const userEmail = currentUser.email;
+      if (userEmail) {
+        allArtisans.forEach(a => {
+          if (a.nom.toLowerCase() === currentUser.full_name?.toLowerCase() || (a as any).email === userEmail) {
+            aliasIds.add(a.id);
+          }
+        });
+      }
+      const userPhone = currentUser.telephone;
+      if (userPhone) {
+        allArtisans.forEach(a => {
+          if (a.telephone && a.telephone.replace(/[^0-9]/g, '') === userPhone.replace(/[^0-9]/g, '')) {
+            aliasIds.add(a.id);
+          }
+        });
+      }
+    } else {
+      // Check if myId is an artisan id
+      const matchArt = allArtisans.find(a => a.id === myId);
+      if (matchArt) {
+        allUsers.forEach(u => {
+          if (u.full_name.toLowerCase() === matchArt.nom.toLowerCase()) {
+            aliasIds.add(u.id);
+          }
+        });
+      }
+    }
+
+    // Merge conversations from all alias IDs
+    const mergedConvs: Conversation[] = [...directConvs];
+    for (const aId of Array.from(aliasIds)) {
+      if (aId !== myId) {
+        const aliasList = this.getStored<Conversation[]>(`convs_${aId}`, []);
+        mergedConvs.push(...aliasList);
+      }
+    }
+
+    // Also scan global conversations and messages to find any conversation where myId or any alias is a participant
+    const globalConvIds = this.getStored<string[]>('all_admin_conv_ids', []);
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.includes('msgs_conv-')) {
+        const cId = k.replace(/^artisanpro_/, '').replace('msgs_', '');
+        if (!globalConvIds.includes(cId)) globalConvIds.push(cId);
+      }
+    }
+
+    const userMap = new Map<string, UserProfile>(allUsers.map(u => [u.id, u]));
+    const artisanMap = new Map<string, Artisan>(allArtisans.map(a => [a.id, a]));
+
+    for (const cId of globalConvIds) {
+      const pair = cId.replace('conv-', '').split('_');
+      if (pair.length === 2) {
+        const isParticipant = Array.from(aliasIds).some(id => id === pair[0] || id === pair[1]);
+        if (isParticipant) {
+          const otherId = Array.from(aliasIds).includes(pair[0]) ? pair[1] : pair[0];
+          const exists = mergedConvs.some(c => c.id === cId || c.contact_id === otherId);
+          if (!exists) {
+            // Retrieve messages to verify conversation has content or was started
+            const msgs = this.getStored<ChatMessage[]>(`msgs_${cId}`, []);
+            const otherUser = userMap.get(otherId);
+            const otherArt = artisanMap.get(otherId);
+
+            let contactName = otherUser?.full_name || otherArt?.nom || 'Contact ArtisanPro';
+            let contactAvatar = otherUser?.avatar_url || (otherArt?.photos ? otherArt.photos[0] : undefined);
+            let contactRole = otherUser?.role === 'artisan' ? (otherUser.metier || 'Artisan') : otherArt ? otherArt.metier : 'Client';
+
+            if (msgs.length > 0) {
+              const otherMsg = msgs.find(m => m.sender_id === otherId);
+              if (otherMsg && (!contactName || contactName.startsWith('Contact'))) {
+                contactName = otherMsg.sender_name;
+              }
+            }
+
+            const lastM = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+            const newReconstructed: Conversation = {
+              id: cId,
+              contact_id: otherId,
+              contact_name: contactName,
+              contact_avatar: contactAvatar,
+              contact_role: contactRole,
+              last_message: lastM ? lastM.text : 'Discussion démarrée',
+              last_message_time: lastM ? new Date(lastM.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Récent',
+              unread_count: 0
+            };
+            mergedConvs.push(newReconstructed);
+          }
+        }
+      }
+    }
+
+    // Filter deleted conversations
+    const activeConvs = mergedConvs.filter(c => !deletedConvIds.includes(c.id));
+
+    // STRICT DEDUPLICATION & CANONICAL ID: 1 SEUL CONTACT ET TRI DU PLUS RÉCENT AU PLUS ANCIEN
+    const seenContactIds = new Set<string>();
+    const seenConvIds = new Set<string>();
+    const deduped: Conversation[] = [];
+
+    for (const conv of activeConvs) {
+      const rawConvId = conv.id;
+      let otherContactId = conv.contact_id;
+      if (!otherContactId || otherContactId === myId || otherContactId === canonicalMyId || Array.from(aliasIds).includes(otherContactId)) {
+        const parts = rawConvId.replace('conv-', '').split('_');
+        if (parts.length === 2) {
+          otherContactId = Array.from(aliasIds).includes(parts[0]) ? parts[1] : parts[0];
+        }
+      }
+      if (!otherContactId || otherContactId === myId || otherContactId === canonicalMyId || Array.from(aliasIds).includes(otherContactId)) {
+        continue;
+      }
+
+      conv.contact_id = otherContactId;
+      const canonicalId = this.getCanonicalConversationId(myId, otherContactId);
+      conv.id = canonicalId;
+
+      const contactKey = (otherContactId || conv.contact_name).toLowerCase().trim();
+      if (seenConvIds.has(conv.id) || seenContactIds.has(contactKey)) {
+        continue;
+      }
+
+      // Check if conversation has messages and calculate accurate timestamp and preview
+      let msgs = this.getStored<ChatMessage[]>(`msgs_${conv.id}`, []);
+      if (msgs.length === 0 && rawConvId && rawConvId !== conv.id) {
+        const fallbackMsgs = this.getStored<ChatMessage[]>(`msgs_${rawConvId}`, []);
+        if (fallbackMsgs.length > 0) {
+          msgs = fallbackMsgs;
+          this.setStored(`msgs_${conv.id}`, msgs);
+        }
+      }
+
+      if (msgs.length > 0) {
+        const lastM = msgs[msgs.length - 1];
+        conv.last_message = lastM.text;
+        conv.last_message_time = new Date(lastM.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        conv.last_message_timestamp = new Date(lastM.created_at).getTime();
+      } else if (!conv.last_message_timestamp) {
+        conv.last_message_timestamp = 0;
+      }
+
+      seenConvIds.add(conv.id);
+      seenContactIds.add(contactKey);
+      deduped.push(conv);
+    }
+
+    // TRI OBLIGATOIRE : DU PLUS RÉCENT AU PLUS ANCIEN
+    deduped.sort((a, b) => (b.last_message_timestamp || 0) - (a.last_message_timestamp || 0));
+
+    // Persist cleaned up conversations back to user storage so it is instant next time
+    this.setStored(`convs_${myId}`, deduped);
+
+    return deduped;
+  }
+
+  async deleteConversationForUser(conversationId: string, myId: string): Promise<boolean> {
+    try {
+      const convsKey = `convs_${myId}`;
+      const convs = this.getStored<Conversation[]>(convsKey, []);
+      this.setStored(convsKey, convs.filter(c => c.id !== conversationId));
+
+      const delKey = `deleted_convs_${myId}`;
+      const delList = this.getStored<string[]>(delKey, []);
+      if (!delList.includes(conversationId)) {
+        this.setStored(delKey, [...delList, conversationId]);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async getAvailableChatUsers(myId: string): Promise<UserProfile[]> {
+    const all = await this.getAllUsers();
+    return all.filter(u => u.id !== myId && u.email.toLowerCase() !== ADMIN_EMAIL.toLowerCase());
+  }
+
+  async startOrGetConversation(myId: string, myName: string, myAvatar: string | undefined, otherUser: UserProfile): Promise<Conversation> {
+    const canonicalMyId = this.resolveUserUuid(myId) || myId;
+    const canonicalOtherId = this.resolveUserUuid(otherUser.id) || otherUser.id;
+    const convId = this.getCanonicalConversationId(canonicalMyId, canonicalOtherId);
+
+    const convsKey = `convs_${myId}`;
+    const convs = this.getStored<Conversation[]>(convsKey, []);
+    
+    // Strict match to avoid duplicate creation
+    const existing = convs.find(c => c.contact_id === otherUser.id || c.contact_id === canonicalOtherId || c.id === convId);
+    if (existing) {
+      existing.id = convId;
+      existing.contact_name = otherUser.full_name;
+      existing.contact_avatar = otherUser.avatar_url || existing.contact_avatar;
+      if (!existing.last_message_timestamp) existing.last_message_timestamp = Date.now();
+      this.setStored(convsKey, convs);
+      return existing;
+    }
+
+    const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    const newConv: Conversation = {
+      id: convId,
+      contact_id: otherUser.id,
+      contact_name: otherUser.full_name,
+      contact_avatar: otherUser.avatar_url,
+      contact_role: otherUser.role === 'admin' ? 'Super Admin & Fondateur' : otherUser.role === 'artisan' ? (otherUser.metier || 'Artisan') : 'Client',
+      last_message: 'Nouvelle conversation démarrée',
+      last_message_time: timeStr,
+      unread_count: 0
+    };
+
+    this.setStored(convsKey, [newConv, ...convs]);
+
+    // Also register immediately on the receiver side for bidirectional messaging
+    const receiverKey = `convs_${otherUser.id}`;
+    const receiverConvs = this.getStored<Conversation[]>(receiverKey, []);
+    if (!receiverConvs.some(c => c.contact_id === myId || c.id === convId)) {
+      const mirrorConv: Conversation = {
+        id: convId,
+        contact_id: myId,
+        contact_name: myName,
+        contact_avatar: myAvatar,
+        contact_role: 'Membre ArtisanPro',
+        last_message: 'Nouvelle conversation démarrée',
+        last_message_time: timeStr,
+        unread_count: 1
+      };
+      this.setStored(receiverKey, [mirrorConv, ...receiverConvs]);
+    }
+
+    // Register into global admin conversations index
+    const allAdminConvs = this.getStored<string[]>('all_admin_conv_ids', []);
+    if (!allAdminConvs.includes(convId)) {
+      this.setStored('all_admin_conv_ids', [convId, ...allAdminConvs]);
+    }
+
+    return newConv;
+  }
+
+  // ADMIN CHAT AUDIT & MONITORING - Displays all conversations and messages on Admin Dashboard
+  async getAllConversationsForAdmin(): Promise<any[]> {
+    const convIdSet = new Set<string>(this.getStored<string[]>('all_admin_conv_ids', []));
+    
+    // Also scan localStorage for any conversation keys
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('msgs_')) {
+          convIdSet.add(k.replace('msgs_', ''));
+        } else if (k && k.startsWith('convs_')) {
+          const list = this.getStored<Conversation[]>(k, []);
+          list.forEach(c => convIdSet.add(c.id));
+        }
+      }
+    } catch {}
+
+    const results: any[] = [];
+    const allUsers = await this.getAllUsers();
+    const userMap = new Map<string, UserProfile>(allUsers.map(u => [u.id, u]));
+
+    for (const cId of Array.from(convIdSet)) {
+      const msgs = this.getStored<ChatMessage[]>(`msgs_${cId}`, []);
+      const pair = cId.replace('conv-', '').split('_');
+      const userA = userMap.get(pair[0]) || { id: pair[0], full_name: 'Utilisateur ' + (pair[0]?.slice(0, 6) || ''), role: 'client' as const, email: '' };
+      const userB = userMap.get(pair[1]) || { id: pair[1], full_name: 'Artisan ' + (pair[1]?.slice(0, 6) || ''), role: 'artisan' as const, email: '' };
+
+      // Derive names from msgs if missing
+      if (msgs.length > 0) {
+        const sender1 = msgs.find(m => m.sender_id === pair[0]);
+        if (sender1 && userA.full_name.startsWith('Utilisateur ')) {
+          userA.full_name = sender1.sender_name;
+        }
+        const sender2 = msgs.find(m => m.sender_id === pair[1]);
+        if (sender2 && userB.full_name.startsWith('Artisan ')) {
+          userB.full_name = sender2.sender_name;
+        }
+      }
+
+      results.push({
+        id: cId,
+        userA,
+        userB,
+        messagesCount: msgs.length,
+        lastMessage: msgs.length > 0 ? msgs[msgs.length - 1] : null,
+        lastMessageTime: msgs.length > 0 ? new Date(msgs[msgs.length - 1].created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Récent',
+        messages: msgs
+      });
+    }
+
+    // Sort by most recent message
+    return results.sort((a, b) => {
+      const timeA = a.lastMessage ? new Date(a.lastMessage.created_at).getTime() : 0;
+      const timeB = b.lastMessage ? new Date(b.lastMessage.created_at).getTime() : 0;
+      return timeB - timeA;
+    });
+  }
+
+  async deleteConversationForAdmin(convId: string): Promise<boolean> {
+    try {
+      localStorage.removeItem(`msgs_${convId}`);
+      const adminIds = this.getStored<string[]>('all_admin_conv_ids', []);
+      this.setStored('all_admin_conv_ids', adminIds.filter(id => id !== convId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async getMessages(conversationId: string): Promise<ChatMessage[]> {
+    const key = `msgs_${conversationId}`;
+    const localMsgs = this.getStored<ChatMessage[]>(key, []);
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true });
+
+      if (!error && data && data.length > 0) {
+        const map = new Map<string, ChatMessage>();
+        for (const m of localMsgs) map.set(m.id, m);
+        for (const m of data) map.set(m.id, m);
+        const merged = Array.from(map.values()).sort(
+          (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+        this.setStored(key, merged);
+        return merged;
+      }
+    } catch (e) {
+      console.warn('Supabase getMessages note:', e);
+    }
+    return localMsgs;
+  }
+
+  async deleteMessage(conversationId: string, messageId: string): Promise<boolean> {
+    try {
+      const key = `msgs_${conversationId}`;
+      const existing = this.getStored<ChatMessage[]>(key, []);
+      this.setStored(key, existing.filter(m => m.id !== messageId));
+
+      try {
+        await supabase.from('messages').delete().eq('id', messageId);
+      } catch {}
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async clearMessages(conversationId: string, myId?: string): Promise<boolean> {
+    try {
+      const key = `msgs_${conversationId}`;
+      this.setStored(key, []);
+
+      try {
+        await supabase.from('messages').delete().eq('conversation_id', conversationId);
+      } catch {}
+
+      if (myId) {
+        const convsKey = `convs_${myId}`;
+        const convs = this.getStored<Conversation[]>(convsKey, []);
+        const idx = convs.findIndex(c => c.id === conversationId);
+        if (idx >= 0) {
+          convs[idx].last_message = 'Discussion réinitialisée';
+          this.setStored(convsKey, convs);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // GUARANTEED SINGLE INSERT WITH ANTI-DOUBLE-CLICK LOCK & UNIQUE SUBMISSION TOKEN
+  async sendMessage(
+    conversationId: string,
+    senderId: string,
+    senderName: string,
+    receiverId: string,
+    text: string,
+    uniqueToken: string,
+    options?: {
+      type?: 'text' | 'voice' | 'file' | 'image';
+      media_url?: string;
+      media_name?: string;
+      media_size?: string;
+      voice_duration?: number;
+    }
+  ): Promise<ChatMessage | null> {
+    const cleanText = text.trim();
+    if (!cleanText && !options?.media_url) return null;
+
+    // Strict Anti-duplicate Lock
+    if (this.pendingMessageTokens.has(uniqueToken)) {
+      console.warn('Duplicate message submission blocked by token:', uniqueToken);
+      return null;
+    }
+    this.pendingMessageTokens.add(uniqueToken);
+
+    try {
+      const canonicalSenderId = this.resolveUserUuid(senderId) || senderId;
+      const canonicalReceiverId = this.resolveUserUuid(receiverId) || receiverId;
+      const canonicalConvId = this.getCanonicalConversationId(canonicalSenderId, canonicalReceiverId);
+
+      const newMsg: ChatMessage = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        conversation_id: canonicalConvId,
+        sender_id: canonicalSenderId,
+        sender_name: senderName,
+        receiver_id: canonicalReceiverId,
+        text: cleanText || (options?.type === 'voice' ? '🎤 Message vocal' : options?.type === 'image' ? '📷 Image' : '📎 Fichier'),
+        created_at: new Date().toISOString(),
+        type: options?.type || 'text',
+        media_url: options?.media_url,
+        media_name: options?.media_name,
+        media_size: options?.media_size,
+        voice_duration: options?.voice_duration
+      };
+
+      // Try inserting into Supabase messages table if available
+      try {
+        const { data: supaMsg, error: supaErr } = await supabase.from('messages').insert({
+          conversation_id: canonicalConvId,
+          sender_id: canonicalSenderId,
+          sender_name: senderName,
+          receiver_id: canonicalReceiverId,
+          text: newMsg.text,
+          type: newMsg.type,
+          media_url: newMsg.media_url || null,
+          media_name: newMsg.media_name || null,
+          media_size: newMsg.media_size || null,
+          voice_duration: newMsg.voice_duration || null
+        }).select().maybeSingle();
+
+        if (!supaErr && supaMsg) {
+          newMsg.id = supaMsg.id;
+          newMsg.created_at = supaMsg.created_at;
+        }
+      } catch (err) {
+        console.warn('Supabase message insert note:', err);
+      }
+
+      const key = `msgs_${canonicalConvId}`;
+      const existing = this.getStored<ChatMessage[]>(key, []);
+      // Check if exact message already exists in the last 2 seconds
+      const isDuplicate = existing.some(
+        m => m.sender_id === senderId && m.text === newMsg.text && Math.abs(new Date(m.created_at).getTime() - Date.now()) < 2000
+      );
+
+      if (isDuplicate) {
+        console.warn('Duplicate message blocked by timestamp & content');
+        return null;
+      }
+
+      this.setStored(key, [...existing, newMsg]);
+
+      // Ensure conversation is in global admin index
+      const adminConvIds = this.getStored<string[]>('all_admin_conv_ids', []);
+      if (!adminConvIds.includes(canonicalConvId)) {
+        this.setStored('all_admin_conv_ids', [canonicalConvId, ...adminConvIds]);
+      }
+
+      const nowTs = Date.now();
+      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      // Update conversation last message for sender & MOVE TO TOP
+      const updateSenderStore = (sId: string) => {
+        const convsKey = `convs_${sId}`;
+        const convs = this.getStored<Conversation[]>(convsKey, []);
+        const idx = convs.findIndex(c => c.id === canonicalConvId || c.contact_id === receiverId || c.contact_id === canonicalReceiverId);
+
+        if (idx >= 0) {
+          const updatedConv: Conversation = {
+            ...convs[idx],
+            id: canonicalConvId,
+            last_message: cleanText,
+            last_message_time: timeStr,
+            last_message_timestamp: nowTs
+          };
+          const rest = convs.filter((_, i) => i !== idx);
+          this.setStored(convsKey, [updatedConv, ...rest]);
+        } else {
+          const senderConv: Conversation = {
+            id: canonicalConvId,
+            contact_id: canonicalReceiverId,
+            contact_name: 'Contact',
+            contact_role: 'Membre ArtisanPro',
+            last_message: cleanText,
+            last_message_time: timeStr,
+            last_message_timestamp: nowTs,
+            unread_count: 0
+          };
+          this.setStored(convsKey, [senderConv, ...convs]);
+        }
+      };
+
+      updateSenderStore(senderId);
+      if (canonicalSenderId !== senderId) updateSenderStore(canonicalSenderId);
+
+      // Also update receiver conversation preview & MOVE TO TOP
+      const updateReceiverStore = (rId: string) => {
+        if (!rId || rId === 'me') return;
+        const rKey = `convs_${rId}`;
+        const rConvs = this.getStored<Conversation[]>(rKey, []);
+        const rIdx = rConvs.findIndex(c => c.id === canonicalConvId || c.contact_id === senderId || c.contact_id === canonicalSenderId);
+
+        if (rIdx >= 0) {
+          const updatedConv: Conversation = {
+            ...rConvs[rIdx],
+            id: canonicalConvId,
+            last_message: cleanText,
+            last_message_time: timeStr,
+            last_message_timestamp: nowTs,
+            unread_count: (rConvs[rIdx].unread_count || 0) + 1
+          };
+          const rest = rConvs.filter((_, i) => i !== rIdx);
+          this.setStored(rKey, [updatedConv, ...rest]);
+        } else {
+          const mirrorConv: Conversation = {
+            id: canonicalConvId,
+            contact_id: canonicalSenderId,
+            contact_name: senderName,
+            contact_avatar: undefined,
+            contact_role: 'Membre ArtisanPro',
+            last_message: cleanText,
+            last_message_time: timeStr,
+            last_message_timestamp: nowTs,
+            unread_count: 1
+          };
+          this.setStored(rKey, [mirrorConv, ...rConvs]);
+        }
+      };
+
+      updateReceiverStore(receiverId);
+      if (canonicalReceiverId !== receiverId) updateReceiverStore(canonicalReceiverId);
+
+      // Broadcast update across tabs and active window
+      if (typeof window !== 'undefined') {
+        try {
+          window.dispatchEvent(new CustomEvent('artisanpro_chat_update', {
+            detail: {
+              conversationId: canonicalConvId,
+              senderId: canonicalSenderId,
+              receiverId: canonicalReceiverId,
+              message: newMsg
+            }
+          }));
+        } catch {}
+      }
+
+      // Try broadcasting via Supabase Realtime channel
+      try {
+        const channel = supabase.channel(`chat_${canonicalConvId}`);
+        await channel.send({
+          type: 'broadcast',
+          event: 'new_message',
+          payload: newMsg
+        });
+      } catch (err) {
+        // Broadcast non-blocking
+      }
+
+      return newMsg;
+    } finally {
+      setTimeout(() => {
+        this.pendingMessageTokens.delete(uniqueToken);
+      }, 1500);
+    }
+  }
+
+  // NOTIFICATIONS
+  async getNotifications(userId: string): Promise<AppNotification[]> {
+    const welcomeNotif: AppNotification[] = [
+      {
+        id: 'notif-welcome',
+        user_id: userId,
+        title: 'Bienvenue sur ArtisanPro Afrique !',
+        message: 'Votre compte est actif. Publiez des créations, trouvez des artisans ou sollicitez une certification officielle.',
+        type: 'system',
+        created_at: new Date().toISOString(),
+        is_read: false
+      }
+    ];
+
+    const userNotifs = this.getStored<AppNotification[]>(`notifs_${userId}`, welcomeNotif);
+    const globalBroadcasts = this.getStored<AppNotification[]>('global_broadcasts', []);
+
+    // Merge without duplicates
+    const all = [...userNotifs, ...globalBroadcasts];
+    const seen = new Set<string>();
+    return all.filter(n => {
+      if (seen.has(n.id)) return false;
+      seen.add(n.id);
+      return true;
+    });
+  }
+
+  async markNotificationAsRead(userId: string, notifId: string): Promise<void> {
+    const notifs = await this.getNotifications(userId);
+    const updated = notifs.map(n => n.id === notifId ? { ...n, is_read: true } : n);
+    this.setStored(`notifs_${userId}`, updated);
+  }
+
+  async markAllNotificationsRead(userId: string): Promise<void> {
+    const notifs = await this.getNotifications(userId);
+    const updated = notifs.map(n => ({ ...n, is_read: true }));
+    this.setStored(`notifs_${userId}`, updated);
+  }
+
+  // ADMIN BROADCAST NOTIFICATION TO ALL USERS
+  async broadcastNotification(title: string, message: string, senderEmail: string): Promise<number> {
+    const notifId = `broadcast-${Date.now()}`;
+    const newNotif: AppNotification = {
+      id: notifId,
+      user_id: 'all',
+      title: title.trim(),
+      message: message.trim(),
+      type: 'system',
+      created_at: new Date().toISOString(),
+      is_read: false
+    };
+
+    // Store in global broadcasts
+    const globals = this.getStored<AppNotification[]>('global_broadcasts', []);
+    this.setStored('global_broadcasts', [newNotif, ...globals]);
+
+    // Send to each registered user list
+    const users = await this.getAllUsers();
+    let sentCount = 0;
+    for (const u of users) {
+      const userKey = `notifs_${u.id}`;
+      const existing = this.getStored<AppNotification[]>(userKey, []);
+      this.setStored(userKey, [newNotif, ...existing]);
+      sentCount++;
+    }
+
+    return sentCount;
+  }
+
+  // REPORTS (SIGNALEMENTS)
+  async submitReport(report: Omit<ProblemReport, 'id' | 'created_at' | 'status'>): Promise<ProblemReport> {
+    const newReport: ProblemReport = {
+      ...report,
+      id: 'rep-' + Date.now(),
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    const reports = this.getStored<ProblemReport[]>('admin_reports', []);
+    this.setStored('admin_reports', [newReport, ...reports]);
+    return newReport;
+  }
+
+  // ARTISAN VERIFICATION REQUESTS (4 REQUIRED DOCUMENTS)
+  async getVerificationRequests(): Promise<ArtisanVerificationRequest[]> {
+    return this.getStored<ArtisanVerificationRequest[]>('artisan_verifications', []);
+  }
+
+  async submitVerificationRequest(
+    req: Omit<ArtisanVerificationRequest, 'id' | 'status' | 'created_at'>
+  ): Promise<ArtisanVerificationRequest> {
+    const newReq: ArtisanVerificationRequest = {
+      ...req,
+      id: 'verif-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+
+    const current = await this.getVerificationRequests();
+    // Replace any existing pending request from the same artisan
+    const filtered = current.filter(r => r.artisan_id !== req.artisan_id);
+    this.setStored('artisan_verifications', [newReq, ...filtered]);
+
+    // Update user profile status to pending
+    const localUsers = this.getRegisteredUsers();
+    const uIdx = localUsers.findIndex(u => u.id === req.artisan_id || u.email.toLowerCase() === req.artisan_email.toLowerCase());
+    if (uIdx >= 0) {
+      localUsers[uIdx].verification_status = 'pending';
+      this.setStored('registered_users', localUsers);
+    }
+
+    return newReq;
+  }
+
+  async reviewVerificationRequest(
+    requestId: string,
+    status: 'verified' | 'rejected',
+    reason?: string
+  ): Promise<boolean> {
+    const requests = await this.getVerificationRequests();
+    const req = requests.find(r => r.id === requestId);
+    if (!req) return false;
+
+    req.status = status;
+    req.reviewed_at = new Date().toISOString();
+    if (reason) req.rejection_reason = reason;
+
+    this.setStored('artisan_verifications', requests);
+
+    // Update the artisan profile
+    const localUsers = this.getRegisteredUsers();
+    const uIdx = localUsers.findIndex(u => u.id === req.artisan_id || u.email.toLowerCase() === req.artisan_email.toLowerCase());
+    if (uIdx >= 0) {
+      if (status === 'verified') {
+        localUsers[uIdx].is_verified = true;
+        localUsers[uIdx].badge_bleu = true;
+        localUsers[uIdx].badge_verified = true;
+        localUsers[uIdx].verification_status = 'verified';
+      } else {
+        localUsers[uIdx].is_verified = false;
+        localUsers[uIdx].badge_bleu = false;
+        localUsers[uIdx].verification_status = 'rejected';
+      }
+      this.setStored('registered_users', localUsers);
+
+      // Also update artisan profile localStorage key
+      const profKey = `artisanpro_profile_${localUsers[uIdx].id}`;
+      const savedProf = localStorage.getItem(profKey);
+      if (savedProf) {
+        try {
+          const parsed = JSON.parse(savedProf);
+          if (status === 'verified') {
+            parsed.is_verified = true;
+            parsed.badge_bleu = true;
+            parsed.verification_status = 'verified';
+          } else {
+            parsed.verification_status = 'rejected';
+          }
+          localStorage.setItem(profKey, JSON.stringify(parsed));
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // Send targeted notification to the artisan
+    const notifTitle = status === 'verified' 
+      ? '🎉 Félicitations ! Votre compte est certifié'
+      : '❌ Dossier de certification non validé';
+    
+    const notifMsg = status === 'verified'
+      ? 'Votre dossier de vérification a été validé avec succès par l\'Administration. Vous bénéficiez désormais du Badge Bleu officiel ArtisanPro !'
+      : (reason || 'Votre dossier a été refusé. Veuillez vérifier vos 4 pièces justificatives (CNI, selfie, atelier, diplôme) et soumettre à nouveau.');
+
+    const notif: AppNotification = {
+      id: `verif-res-${Date.now()}`,
+      user_id: req.artisan_id,
+      title: notifTitle,
+      message: notifMsg,
+      type: 'verification',
+      created_at: new Date().toISOString(),
+      is_read: false
+    };
+
+    const notifKey = `notifs_${req.artisan_id}`;
+    const userNotifs = this.getStored<AppNotification[]>(notifKey, []);
+    this.setStored(notifKey, [notif, ...userNotifs]);
+
+    return true;
+  }
+
+  async addNotification(notif: {
+    user_id: string;
+    title: string;
+    message: string;
+    type: 'like' | 'comment' | 'message' | 'verification' | 'system';
+    created_at?: string;
+  }): Promise<AppNotification> {
+    const newNotif: AppNotification = {
+      id: `notif-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      user_id: notif.user_id,
+      title: notif.title,
+      message: notif.message,
+      type: notif.type,
+      created_at: notif.created_at || new Date().toISOString(),
+      is_read: false
+    };
+    const key = `notifs_${notif.user_id}`;
+    const current = this.getStored<AppNotification[]>(key, []);
+    this.setStored(key, [newNotif, ...current]);
+    return newNotif;
+  }
+
+  // SUBSCRIPTION PROOFS (GENIUSPAY PROOF WORKFLOW)
+  async getSubscriptionProofs(): Promise<SubscriptionPaymentProof[]> {
+    return this.getStored<SubscriptionPaymentProof[]>('subscription_proofs', []);
+  }
+
+  async submitSubscriptionProof(proof: Omit<SubscriptionPaymentProof, 'id' | 'status' | 'created_at'>): Promise<SubscriptionPaymentProof> {
+    const newProof: SubscriptionPaymentProof = {
+      ...proof,
+      id: `sub-proof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+
+    const current = await this.getSubscriptionProofs();
+    const updated = [newProof, ...current];
+    this.setStored('subscription_proofs', updated);
+
+    // Also notify admin
+    const adminNotif: AppNotification = {
+      id: `admin-sub-notif-${Date.now()}`,
+      user_id: 'admin-adanmitondejunior07',
+      title: `💰 Preuve paiement : ${proof.artisan_name}`,
+      message: `Nouvelle preuve d'abonnement ${proof.plan_name} (${proof.period}) de ${proof.amount_fcfa} FCFA soumise via GeniusPay.`,
+      type: 'system',
+      created_at: new Date().toISOString(),
+      is_read: false
+    };
+    const adminNotifs = this.getStored<AppNotification[]>('notifs_admin-adanmitondejunior07', []);
+    this.setStored('notifs_admin-adanmitondejunior07', [adminNotif, ...adminNotifs]);
+
+    return newProof;
+  }
+
+  async validateSubscriptionProof(proofId: string): Promise<boolean> {
+    const current = await this.getSubscriptionProofs();
+    const proof = current.find(p => p.id === proofId);
+    if (!proof) return false;
+
+    const now = new Date();
+    // Expiration date calculation: +1 month or +1 year
+    const expiresDate = new Date();
+    if (proof.period === 'mensuel') {
+      expiresDate.setMonth(expiresDate.getMonth() + 1);
+    } else {
+      expiresDate.setFullYear(expiresDate.getFullYear() + 1);
+    }
+    const expiresAtIso = expiresDate.toISOString();
+
+    const updated = current.map(p => {
+      if (p.id === proofId) {
+        return {
+          ...p,
+          status: 'validated' as const,
+          reviewed_at: now.toISOString(),
+          expires_at: expiresAtIso
+        };
+      }
+      return p;
+    });
+    this.setStored('subscription_proofs', updated);
+
+    // Update artisan user profile (badge bleu, is_verified, subscription_plan, subscription_expires_at)
+    const profileKey = `artisanpro_profile_${proof.artisan_id}`;
+    const userProfileStr = localStorage.getItem(profileKey);
+    if (userProfileStr) {
+      try {
+        const uProf = JSON.parse(userProfileStr);
+        const updatedProf: UserProfile = {
+          ...uProf,
+          is_verified: true,
+          badge_bleu: true,
+          badge_verified: true,
+          subscription_plan: proof.plan_id,
+          subscription_period: proof.period,
+          subscription_expires_at: expiresAtIso
+        };
+        localStorage.setItem(profileKey, JSON.stringify(updatedProf));
+        this.saveRegisteredUser(updatedProf);
+      } catch (e) {
+        console.warn('Error updating profile with subscription:', e);
+      }
+    }
+
+    // Try remote update in Supabase profiles
+    try {
+      await supabase.from('profiles').update({
+        is_verified: true,
+        badge_bleu: true,
+        subscription_plan: proof.plan_id,
+        subscription_expires_at: expiresAtIso
+      }).eq('id', proof.artisan_id);
+    } catch {}
+
+    // Send confirmation notification to artisan
+    const notif: AppNotification = {
+      id: `sub-val-${Date.now()}`,
+      user_id: proof.artisan_id,
+      title: `🎉 Abonnement ${proof.plan_name} validé !`,
+      message: `Votre paiement GeniusPay a été validé avec succès par l'Administration. Votre Badge Bleu Pro et vos avantages exclusifs sont activés jusqu'au ${expiresDate.toLocaleDateString('fr-FR')}.`,
+      type: 'verification',
+      created_at: now.toISOString(),
+      is_read: false
+    };
+    const userNotifKey = `notifs_${proof.artisan_id}`;
+    const userNotifs = this.getStored<AppNotification[]>(userNotifKey, []);
+    this.setStored(userNotifKey, [notif, ...userNotifs]);
+
+    return true;
+  }
+
+  async rejectSubscriptionProof(proofId: string, reason: string): Promise<boolean> {
+    const current = await this.getSubscriptionProofs();
+    const proof = current.find(p => p.id === proofId);
+    if (!proof) return false;
+
+    const now = new Date();
+    const updated = current.map(p => {
+      if (p.id === proofId) {
+        return {
+          ...p,
+          status: 'rejected' as const,
+          rejection_reason: reason || 'Preuve de paiement non lisible ou non valide sur GeniusPay.',
+          reviewed_at: now.toISOString()
+        };
+      }
+      return p;
+    });
+    this.setStored('subscription_proofs', updated);
+
+    // Send notification to artisan
+    const notif: AppNotification = {
+      id: `sub-rej-${Date.now()}`,
+      user_id: proof.artisan_id,
+      title: `❌ Preuve d'abonnement non validée`,
+      message: reason || 'Votre preuve de paiement n\'a pas pu être validée. Veuillez renvoyer une capture d\'écran claire de votre reçu GeniusPay.',
+      type: 'system',
+      created_at: now.toISOString(),
+      is_read: false
+    };
+    const userNotifKey = `notifs_${proof.artisan_id}`;
+    const userNotifs = this.getStored<AppNotification[]>(userNotifKey, []);
+    this.setStored(userNotifKey, [notif, ...userNotifs]);
+
+    return true;
+  }
+
+  // ADMIN OPERATIONS - ZERO SAMPLE USERS
+  async getAdminStats() {
+    const users = await this.getAllUsers();
+    const artisans = await this.getArtisans();
+    const pubs = await this.getPublications();
+    const reports = this.getStored<ProblemReport[]>('admin_reports', []);
+    const verifs = await this.getVerificationRequests();
+    const pendingVerifs = verifs.filter(v => v.status === 'pending').length;
+    const subProofs = await this.getSubscriptionProofs();
+    const pendingSubs = subProofs.filter(s => s.status === 'pending').length;
+
+    return {
+      totalUsers: users.length,
+      totalArtisans: artisans.length,
+      totalPublications: pubs.length,
+      totalReports: reports.length,
+      pendingVerifications: pendingVerifs,
+      pendingSubscriptions: pendingSubs
+    };
+  }
+
+  // GET ALL REAL USERS (ONLY GENUINELY REGISTERED USERS)
+  async getAllUsers(): Promise<UserProfile[]> {
+    const list: UserProfile[] = [];
+
+    // Always include founder admin
+    list.push({
+      id: 'admin-adanmitondejunior07',
+      email: ADMIN_EMAIL,
+      full_name: 'Adanmitonde Junior (Fondateur)',
+      nom: 'Junior',
+      prenom: 'Adanmitonde',
+      telephone: '+225 0503444508',
+      role: 'admin',
+      pays: 'Côte d\'Ivoire',
+      ville: 'Abidjan',
+      is_verified: true,
+      badge_bleu: true,
+      is_fondateur: true,
+      created_at: '2026-01-01T00:00:00Z'
+    });
+
+    // 1. Charger les artisans réels depuis la table public.artisans
+    try {
+      const { data: artisansData } = await supabase
+        .from('artisans')
+        .select('id, nom, telephone, whatsapp, metier, ville, is_verified, badge_bleu, is_fondateur, created_at');
+
+      if (artisansData && artisansData.length > 0) {
+        artisansData.forEach(a => {
+          const isFounder = Boolean(
+            a.is_fondateur ||
+            (a.telephone && a.telephone.includes('0503444508')) ||
+            (a.nom && a.nom.toLowerCase().includes('fondateur'))
+          );
+          list.push({
+            id: a.id,
+            email: isFounder ? ADMIN_EMAIL : (a.telephone ? `${a.telephone.replace(/[^0-9]/g, '')}@artisanpro.afrique` : `artisan_${a.id.slice(0, 8)}@artisanpro.afrique`),
+            full_name: a.nom || 'Artisan Partenaire',
+            role: isFounder ? 'admin' : 'artisan',
+            metier: a.metier || 'Artisan',
+            telephone: a.telephone || a.whatsapp || undefined,
+            ville: a.ville || 'Abidjan',
+            pays: "Côte d'Ivoire",
+            is_verified: a.is_verified ?? false,
+            badge_bleu: a.badge_bleu ?? false,
+            is_fondateur: isFounder,
+            created_at: a.created_at || new Date().toISOString()
+          });
+        });
+      }
+    } catch (e) {
+      console.warn('getAllUsers artisans table note:', e);
+    }
+
+    // 2. Charger les clients réels depuis la table public.clients
+    try {
+      const { data: clientsData } = await supabase
+        .from('clients')
+        .select('id, nom, telephone, ville, is_verified, created_at');
+
+      if (clientsData && clientsData.length > 0) {
+        clientsData.forEach(c => {
+          list.push({
+            id: c.id,
+            email: c.telephone ? `${c.telephone.replace(/[^0-9]/g, '')}@artisanpro.afrique` : `client_${c.id.slice(0, 8)}@artisanpro.afrique`,
+            full_name: c.nom || 'Client Partenaire',
+            role: 'client',
+            telephone: c.telephone || undefined,
+            ville: c.ville || 'Abidjan',
+            pays: "Côte d'Ivoire",
+            is_verified: c.is_verified ?? false,
+            badge_bleu: false,
+            is_fondateur: false,
+            created_at: c.created_at || new Date().toISOString()
+          });
+        });
+      }
+    } catch (e) {
+      console.warn('getAllUsers clients table note:', e);
+    }
+
+    // 3. Charger les profils réels depuis la table public.profils
+    try {
+      const { data: profilsData } = await supabase
+        .from('profils')
+        .select('id, nom_complet, metier, telephone, photo_profil, ville_pays');
+
+      if (profilsData && profilsData.length > 0) {
+        profilsData.forEach(p => {
+          const isFounder = p.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
+            p.id === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb' ||
+            Boolean(p.metier?.includes('Administrateur'));
+          const hasRealName = Boolean(p.nom_complet && p.nom_complet.trim() !== '' && p.nom_complet.trim() !== 'Nouvel Artisan');
+          const isArtisan = Boolean(p.metier && p.metier !== 'Membre' && p.metier !== 'Nouvel Artisan');
+
+          list.push({
+            id: p.id,
+            email: isFounder ? ADMIN_EMAIL : (p.telephone ? `${p.telephone.replace(/[^0-9]/g, '')}@artisanpro.afrique` : `user_${p.id.slice(0, 8)}@artisanpro.afrique`),
+            full_name: hasRealName ? p.nom_complet! : (isFounder ? 'Junior Adanmitonde (Fondateur)' : 'Utilisateur ArtisanPro'),
+            role: isFounder ? 'admin' : (isArtisan ? 'artisan' : 'client'),
+            metier: isFounder ? undefined : (isArtisan ? p.metier : undefined),
+            telephone: p.telephone || undefined,
+            avatar_url: p.photo_profil || undefined,
+            is_verified: isFounder,
+            badge_bleu: isFounder,
+            is_fondateur: isFounder,
+            created_at: new Date().toISOString()
+          });
+        });
+      }
+    } catch (e) {
+      console.warn('getAllUsers profils table note:', e);
+    }
+
+    // 4. Charger également depuis profiles si la table est accessible
+    try {
+      const { data: profilesData } = await supabase
+        .from('profiles')
+        .select('id, email, full_name, role, is_verified, badge_bleu, is_fondateur, created_at');
+
+      if (profilesData && profilesData.length > 0) {
+        profilesData.forEach(p => {
+          list.push({
+            id: p.id,
+            email: p.email,
+            full_name: p.full_name || p.email.split('@')[0],
+            role: (p.role as any) || 'client',
+            is_verified: p.is_verified,
+            badge_bleu: p.badge_bleu,
+            is_fondateur: p.is_fondateur,
+            created_at: p.created_at
+          });
+        });
+      }
+    } catch {}
+
+    // 5. Inclure les utilisateurs enregistrés localement
+    const localUsers = this.getRegisteredUsers();
+    list.push(...localUsers);
+
+    // Déduplication par ID puis par email/téléphone pour éviter tout doublon
+    const seenIds = new Set<string>();
+    const seenEmails = new Set<string>();
+    const finalList: UserProfile[] = [];
+
+    // Priorité absolue au compte fondateur
+    const founderEntry = list.find(u => u.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim() || u.is_fondateur);
+    if (founderEntry) {
+      finalList.push(founderEntry);
+      seenIds.add(founderEntry.id);
+      seenEmails.add(ADMIN_EMAIL.toLowerCase().trim());
+    }
+
+    for (const u of list) {
+      const emailKey = (u.email || '').toLowerCase().trim();
+      if (emailKey === ADMIN_EMAIL.toLowerCase().trim()) continue; // Déjà ajouté
+      if (seenIds.has(u.id)) continue;
+      if (emailKey && seenEmails.has(emailKey)) continue;
+
+      seenIds.add(u.id);
+      if (emailKey) seenEmails.add(emailKey);
+      finalList.push(u);
+    }
+
+    return finalList;
+  }
+
+  async toggleSuspendUser(userId: string, reason: string = 'Non-respect des règles de la communauté'): Promise<boolean> {
+    const suspended = this.getStored<string[]>('suspended_users', []);
+    const isSusp = suspended.includes(userId);
+    const updated = isSusp ? suspended.filter(id => id !== userId) : [...suspended, userId];
+    this.setStored('suspended_users', updated);
+    
+    const reasons = this.getStored<Record<string, string>>('suspended_reasons', {});
+    if (!isSusp) {
+      reasons[userId] = reason;
+    } else {
+      delete reasons[userId];
+    }
+    this.setStored('suspended_reasons', reasons);
+
+    return !isSusp;
+  }
+
+  isUserSuspended(userId: string): boolean {
+    const suspended = this.getStored<string[]>('suspended_users', []);
+    return suspended.includes(userId);
+  }
+
+  getSuspensionReason(userId: string): string {
+    const reasons = this.getStored<Record<string, string>>('suspended_reasons', {});
+    return reasons[userId] || 'Non-respect des règles de la communauté et de la plateforme.';
+  }
+
+  // ==========================================
+  // PORTEFEUILLE (WALLET) & TRANSACTIONS
+  // ==========================================
+  async getWallet(userId: string): Promise<UserWallet> {
+    await this.ensureHydrated();
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    if (wallets[userId]) {
+      return wallets[userId];
+    }
+    const newWallet: UserWallet = {
+      id: 'wlt-' + userId.slice(0, 8),
+      user_id: userId,
+      balance_fcfa: 0,
+      currency: 'FCFA',
+      updated_at: new Date().toISOString()
+    };
+    wallets[userId] = newWallet;
+    this.setStored('wallets', wallets);
+    return newWallet;
+  }
+
+  async getAllWallets(): Promise<UserWallet[]> {
+    await this.ensureHydrated();
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    return Object.values(wallets);
+  }
+
+  async getWalletTransactions(userId: string): Promise<WalletTransaction[]> {
+    await this.ensureHydrated();
+    const txs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    return txs
+      .filter(t => t.user_id === userId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async getAllTransactions(): Promise<WalletTransaction[]> {
+    await this.ensureHydrated();
+    const txs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    return [...txs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async createDepositTransaction(
+    userId: string,
+    amount: number,
+    provider: PaymentProvider,
+    phoneNumber: string,
+    providerRef: string,
+    userName?: string
+  ): Promise<{ success: boolean; transaction: WalletTransaction; newBalance: number }> {
+    await this.ensureHydrated();
+    const integerAmount = Math.max(100, Math.round(amount));
+    const wallet = await this.getWallet(userId);
+
+    const newTx: WalletTransaction = {
+      id: 'tx-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      wallet_id: wallet.id,
+      user_id: userId,
+      user_name: userName || 'Utilisateur',
+      type: 'deposit',
+      amount_fcfa: integerAmount,
+      status: 'completed',
+      provider: provider,
+      reference: 'DEP-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(1000 + Math.random() * 9000),
+      provider_ref: providerRef.trim() || `TEL-${phoneNumber}`,
+      description: `Recharge portefeuille via ${provider.replace('_', ' ').toUpperCase()} (${phoneNumber})`,
+      created_at: new Date().toISOString(),
+      confirmed_at: new Date().toISOString()
+    };
+
+    // Credit wallet
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    wallet.balance_fcfa += integerAmount;
+    wallet.updated_at = new Date().toISOString();
+    wallets[userId] = wallet;
+    this.setStored('wallets', wallets);
+
+    // Save transaction
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    this.setStored('wallet_transactions', [newTx, ...allTxs]);
+
+    // Send notification
+    await this.addNotification({
+      user_id: userId,
+      title: 'Recharge réussie ✅',
+      message: `Votre portefeuille a été crédité de ${integerAmount.toLocaleString('fr-FR')} FCFA via ${provider.toUpperCase()}.`,
+      type: 'system',
+      created_at: new Date().toISOString()
+    });
+
+    return { success: true, transaction: newTx, newBalance: wallet.balance_fcfa };
+  }
+
+  async initiateGeniusPayRecharge(
+    userId: string,
+    amount: number,
+    reference: string,
+    phoneNumber?: string,
+    userName?: string
+  ): Promise<{ success: boolean; transaction: WalletTransaction }> {
+    await this.ensureHydrated();
+    const integerAmount = Math.max(100, Math.round(amount));
+    const wallet = await this.getWallet(userId);
+
+    const newTx: WalletTransaction = {
+      id: 'tx-gp-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      wallet_id: wallet.id,
+      user_id: userId,
+      user_name: userName || 'Utilisateur',
+      type: 'deposit',
+      amount_fcfa: integerAmount,
+      status: 'pending', // INITIAL STATUS IS STRICTLY PENDING
+      provider: 'geniuspay',
+      reference: reference,
+      provider_ref: reference,
+      description: `Recharge GeniusPay Sandbox (${phoneNumber || 'En ligne'}) - En attente`,
+      created_at: new Date().toISOString()
+    };
+
+    // Save pending transaction WITHOUT crediting wallet
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    this.setStored('wallet_transactions', [newTx, ...allTxs]);
+
+    return { success: true, transaction: newTx };
+  }
+
+  async confirmGeniusPayRecharge(
+    reference: string,
+    confirmedAmount?: number
+  ): Promise<{ success: boolean; transaction?: WalletTransaction; alreadyProcessed?: boolean; error?: string }> {
+    await this.ensureHydrated();
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    const txIndex = allTxs.findIndex(t => t.reference === reference || t.provider_ref === reference);
+
+    if (txIndex === -1) {
+      return { success: false, error: 'Transaction non trouvée' };
+    }
+
+    const tx = allTxs[txIndex];
+
+    // VERROU STRICT D'IDEMPOTENCE
+    if (tx.status === 'completed') {
+      return { success: true, transaction: tx, alreadyProcessed: true };
+    }
+
+    const creditAmount = confirmedAmount && confirmedAmount > 0 ? confirmedAmount : tx.amount_fcfa;
+
+    // Lock status to completed
+    const updatedTx: WalletTransaction = {
+      ...tx,
+      amount_fcfa: creditAmount,
+      status: 'completed',
+      confirmed_at: new Date().toISOString(),
+      description: `Recharge GeniusPay Sandbox (${creditAmount.toLocaleString('fr-FR')} FCFA) - Confirmée`
+    };
+
+    allTxs[txIndex] = updatedTx;
+    this.setStored('wallet_transactions', allTxs);
+
+    // Credit user's wallet
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    const userWallet = await this.getWallet(tx.user_id);
+    userWallet.balance_fcfa += creditAmount;
+    userWallet.updated_at = new Date().toISOString();
+    wallets[tx.user_id] = userWallet;
+    this.setStored('wallets', wallets);
+
+    // Add confirmed notification
+    await this.addNotification({
+      user_id: tx.user_id,
+      title: 'Recharge GeniusPay confirmée ✅',
+      message: `Votre portefeuille a été crédité de ${creditAmount.toLocaleString('fr-FR')} FCFA via GeniusPay Sandbox.`,
+      type: 'system',
+      created_at: new Date().toISOString()
+    });
+
+    return { success: true, transaction: updatedTx, alreadyProcessed: false };
+  }
+
+  async payArtisanFromWallet(
+    clientId: string,
+    artisanId: string,
+    amount: number,
+    missionId: string,
+    description: string
+  ): Promise<{ success: boolean; error?: string; clientTx?: WalletTransaction }> {
+    await this.ensureHydrated();
+    const integerAmount = Math.max(1, Math.round(amount));
+    const clientWallet = await this.getWallet(clientId);
+
+    if (clientWallet.balance_fcfa < integerAmount) {
+      return { 
+        success: false, 
+        error: `Solde insuffisant (${clientWallet.balance_fcfa.toLocaleString('fr-FR')} FCFA). Veuillez recharger votre portefeuille.` 
+      };
+    }
+
+    const settings = await this.getPlatformSettings();
+    const commission = Math.round(integerAmount * (settings.commission_percent / 100));
+    const artisanShare = integerAmount - commission;
+
+    // 1. Debit Client
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    clientWallet.balance_fcfa -= integerAmount;
+    clientWallet.updated_at = new Date().toISOString();
+    wallets[clientId] = clientWallet;
+
+    // 2. Credit Artisan
+    const artisanWallet = await this.getWallet(artisanId);
+    artisanWallet.balance_fcfa += artisanShare;
+    artisanWallet.updated_at = new Date().toISOString();
+    wallets[artisanId] = artisanWallet;
+    this.setStored('wallets', wallets);
+
+    const ref = 'PAY-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(1000 + Math.random() * 9000);
+
+    // 3. Transactions
+    const clientTx: WalletTransaction = {
+      id: 'tx-cli-' + Date.now(),
+      wallet_id: clientWallet.id,
+      user_id: clientId,
+      type: 'payment',
+      amount_fcfa: integerAmount,
+      status: 'completed',
+      provider: 'wallet_internal',
+      reference: ref,
+      description: description,
+      mission_id: missionId,
+      created_at: new Date().toISOString(),
+      confirmed_at: new Date().toISOString()
+    };
+
+    const artisanTx: WalletTransaction = {
+      id: 'tx-art-' + Date.now(),
+      wallet_id: artisanWallet.id,
+      user_id: artisanId,
+      type: 'deposit',
+      amount_fcfa: artisanShare,
+      status: 'completed',
+      provider: 'wallet_internal',
+      reference: 'REC-' + ref,
+      description: `Règlement mission (${artisanShare.toLocaleString('fr-FR')} FCFA net après commission)`,
+      mission_id: missionId,
+      created_at: new Date().toISOString(),
+      confirmed_at: new Date().toISOString()
+    };
+
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    this.setStored('wallet_transactions', [clientTx, artisanTx, ...allTxs]);
+
+    // Send notifications
+    await this.addNotification({
+      user_id: clientId,
+      title: 'Paiement effectué',
+      message: `Paiement de ${integerAmount.toLocaleString('fr-FR')} FCFA validé.`,
+      type: 'system',
+      created_at: new Date().toISOString()
+    });
+
+    await this.addNotification({
+      user_id: artisanId,
+      title: 'Paiement reçu ✅',
+      message: `Vous avez reçu ${artisanShare.toLocaleString('fr-FR')} FCFA pour votre intervention.`,
+      type: 'system',
+      created_at: new Date().toISOString()
+    });
+
+    return { success: true, clientTx };
+  }
+
+  async requestPayout(
+    artisanId: string,
+    amount: number,
+    provider: PaymentProvider,
+    phone: string,
+    artisanName?: string
+  ): Promise<{ success: boolean; error?: string; transaction?: WalletTransaction }> {
+    await this.ensureHydrated();
+    const integerAmount = Math.max(1000, Math.round(amount));
+    const wallet = await this.getWallet(artisanId);
+
+    if (wallet.balance_fcfa < integerAmount) {
+      return { 
+        success: false, 
+        error: `Solde insuffisant pour ce retrait (${wallet.balance_fcfa.toLocaleString('fr-FR')} FCFA disponibles).` 
+      };
+    }
+
+    // Deduct from available balance immediately to prevent double spending
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    wallet.balance_fcfa -= integerAmount;
+    wallet.updated_at = new Date().toISOString();
+    wallets[artisanId] = wallet;
+    this.setStored('wallets', wallets);
+
+    const newTx: WalletTransaction = {
+      id: 'tx-ret-' + Date.now(),
+      wallet_id: wallet.id,
+      user_id: artisanId,
+      user_name: artisanName,
+      type: 'payout',
+      amount_fcfa: integerAmount,
+      status: 'pending',
+      provider: provider,
+      reference: 'RET-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(1000 + Math.random() * 9000),
+      provider_ref: phone,
+      description: `Demande de retrait vers ${provider.replace('_', ' ').toUpperCase()} (${phone})`,
+      created_at: new Date().toISOString()
+    };
+
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    this.setStored('wallet_transactions', [newTx, ...allTxs]);
+
+    return { success: true, transaction: newTx };
+  }
+
+  async adminApprovePayout(transactionId: string): Promise<boolean> {
+    await this.ensureHydrated();
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    const idx = allTxs.findIndex(t => t.id === transactionId);
+    if (idx >= 0 && allTxs[idx].status === 'pending') {
+      allTxs[idx].status = 'completed';
+      allTxs[idx].confirmed_at = new Date().toISOString();
+      this.setStored('wallet_transactions', allTxs);
+
+      await this.addNotification({
+        user_id: allTxs[idx].user_id,
+        title: 'Retrait validé ✅',
+        message: `Votre retrait de ${allTxs[idx].amount_fcfa.toLocaleString('fr-FR')} FCFA a été transféré sur votre numéro ${allTxs[idx].provider_ref}.`,
+        type: 'system',
+        created_at: new Date().toISOString()
+      });
+      return true;
+    }
+    return false;
+  }
+
+  async adminRefundTransaction(transactionId: string): Promise<boolean> {
+    await this.ensureHydrated();
+    const allTxs = this.getStored<WalletTransaction[]>('wallet_transactions', []);
+    const tx = allTxs.find(t => t.id === transactionId);
+    if (!tx) return false;
+
+    // Refund user wallet
+    const wallet = await this.getWallet(tx.user_id);
+    const wallets = this.getStored<Record<string, UserWallet>>('wallets', {});
+    wallet.balance_fcfa += tx.amount_fcfa;
+    wallet.updated_at = new Date().toISOString();
+    wallets[tx.user_id] = wallet;
+    this.setStored('wallets', wallets);
+
+    const refundTx: WalletTransaction = {
+      id: 'tx-ref-' + Date.now(),
+      wallet_id: wallet.id,
+      user_id: tx.user_id,
+      type: 'refund',
+      amount_fcfa: tx.amount_fcfa,
+      status: 'completed',
+      provider: tx.provider,
+      reference: 'REF-' + tx.reference,
+      description: `Remboursement de la transaction ${tx.reference}`,
+      mission_id: tx.mission_id,
+      created_at: new Date().toISOString(),
+      confirmed_at: new Date().toISOString()
+    };
+
+    this.setStored('wallet_transactions', [refundTx, ...allTxs]);
+
+    await this.addNotification({
+      user_id: tx.user_id,
+      title: 'Remboursement effectué 🔄',
+      message: `Votre remboursement de ${tx.amount_fcfa.toLocaleString('fr-FR')} FCFA a été crédité sur votre portefeuille.`,
+      type: 'system',
+      created_at: new Date().toISOString()
+    });
+
+    return true;
+  }
+
+  // ==========================================
+  // PARAMÈTRES DE LA PLATEFORME (ADMIN)
+  // ==========================================
+  async getPlatformSettings(): Promise<PlatformSettings> {
+    await this.ensureHydrated();
+    const DEFAULT_PAYMENT_METHODS_BY_COUNTRY: Record<string, string[]> = {
+      'Côte d\'Ivoire': ['Orange Money', 'MTN MoMo', 'Moov Money', 'Wave'],
+      'Sénégal': ['Wave', 'Orange Money', 'Free Money'],
+      'Bénin': ['MTN MoMo', 'Moov Money', 'Celtiis Cash'],
+      'Togo': ['T-Money', 'Moov Money'],
+      'Cameroun': ['MTN MoMo', 'Orange Money'],
+      'Mali': ['Orange Money', 'Moov Money', 'Wave'],
+      'Burkina Faso': ['Orange Money', 'Moov Money'],
+      'Guinée': ['Orange Money', 'MTN MoMo'],
+      'Niger': ['Airtel Money', 'Moov Money'],
+      'Gabon': ['Airtel Money', 'Moov Money'],
+      'Congo': ['Airtel Money', 'MTN MoMo'],
+      'RD Congo': ['M-Pesa', 'Orange Money', 'Airtel Money']
+    };
+
+    const defaults: PlatformSettings = {
+      urgency_fee_fcfa: 2500,
+      commission_percent: 10,
+      default_search_radius_km: 10,
+      max_search_radius_km: 30,
+      artisan_response_timeout_seconds: 45,
+      enabled_payment_methods_by_country: DEFAULT_PAYMENT_METHODS_BY_COUNTRY
+    };
+
+    const stored = this.getStored<PlatformSettings>('platform_settings', defaults);
+    return { ...defaults, ...stored };
+  }
+
+  async updatePlatformSettings(settings: Partial<PlatformSettings>): Promise<PlatformSettings> {
+    await this.ensureHydrated();
+    const current = await this.getPlatformSettings();
+    const updated = { ...current, ...settings };
+    this.setStored('platform_settings', updated);
+    return updated;
+  }
+
+  // ==========================================
+  // DEMANDES D'INTERVENTION & GPS INTELLIGENT
+  // ==========================================
+  async getServiceRequests(filter?: { clientId?: string; artisanId?: string }): Promise<ServiceRequest[]> {
+    await this.ensureHydrated();
+    const all = this.getStored<ServiceRequest[]>('service_requests', []);
+    return all.filter(req => {
+      if (filter?.clientId && req.client_id !== filter.clientId) return false;
+      if (filter?.artisanId && req.assigned_artisan_id !== filter.artisanId) return false;
+      return true;
+    }).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async getAllServiceRequests(): Promise<ServiceRequest[]> {
+    await this.ensureHydrated();
+    const all = this.getStored<ServiceRequest[]>('service_requests', []);
+    return [...all].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async createServiceRequest(
+    data: Omit<ServiceRequest, 'id' | 'created_at' | 'updated_at' | 'status'>
+  ): Promise<ServiceRequest> {
+    await this.ensureHydrated();
+    const newReq: ServiceRequest = {
+      ...data,
+      id: 'req-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      status: data.type === 'urgent' && !data.is_urgency_paid ? 'pending_payment' : 'searching_artisan',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const current = this.getStored<ServiceRequest[]>('service_requests', []);
+    this.setStored('service_requests', [newReq, ...current]);
+    return newReq;
+  }
+
+  async updateServiceRequest(requestId: string, updates: Partial<ServiceRequest>): Promise<ServiceRequest | null> {
+    await this.ensureHydrated();
+    const current = this.getStored<ServiceRequest[]>('service_requests', []);
+    const idx = current.findIndex(r => r.id === requestId);
+    if (idx >= 0) {
+      current[idx] = {
+        ...current[idx],
+        ...updates,
+        updated_at: new Date().toISOString()
+      };
+      this.setStored('service_requests', current);
+      return current[idx];
+    }
+    return null;
+  }
+
+  // ALGORITHME DE DISTRIBUTION GPS INTELLIGENT
+  async findNearbyAvailableArtisans(
+    metier: string,
+    clientLat: number,
+    clientLng: number,
+    maxRadiusKm?: number
+  ): Promise<Array<{ artisan: Artisan; distanceKm: number }>> {
+    await this.ensureHydrated();
+    const allArtisans = await this.getArtisans();
+    const settings = await this.getPlatformSettings();
+    const radius = maxRadiusKm || settings.default_search_radius_km;
+
+    // Check currently busy artisans
+    const activeRequests = await this.getAllServiceRequests();
+    const busyArtisanIds = new Set(
+      activeRequests
+        .filter(r => ['artisan_accepted', 'artisan_en_route', 'artisan_arrived', 'in_progress'].includes(r.status))
+        .map(r => r.assigned_artisan_id)
+        .filter(Boolean)
+    );
+
+    const results: Array<{ artisan: Artisan; distanceKm: number }> = [];
+
+    for (const a of allArtisans) {
+      // 1. Must match craft / metier
+      if (metier !== 'Tous' && a.metier?.toLowerCase() !== metier.toLowerCase()) {
+        continue;
+      }
+
+      // 2. Must not be suspended
+      if (this.isUserSuspended(a.id)) {
+        continue;
+      }
+
+      // 3. Must be available and not occupied on another mission
+      if (a.disponible === false || busyArtisanIds.has(a.id)) {
+        continue;
+      }
+
+      // 4. Calculate real distance using coordinates
+      let dist = 3.5; // fallback average distance in km if no GPS
+      if (a.gps_lat && a.gps_lng && clientLat && clientLng) {
+        dist = this.computeDistanceKm(clientLat, clientLng, a.gps_lat, a.gps_lng);
+      }
+
+      if (dist <= radius) {
+        results.push({ artisan: a, distanceKm: dist });
+      }
+    }
+
+    // Sort by distance ascending
+    return results.sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+
+  computeDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // Earth's radius in km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = 
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Math.round(R * c * 10) / 10;
+  }
+}
+
+export const dataStore = new DataStoreService();

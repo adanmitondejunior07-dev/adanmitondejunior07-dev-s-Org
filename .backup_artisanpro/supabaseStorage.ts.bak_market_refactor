@@ -1,0 +1,243 @@
+import { idbStorage } from './idbStorage';
+
+/**
+ * Resilient Supabase Auth Storage Adapter for ArtisanPro Afrique
+ * 
+ * Prevents "QuotaExceededError: Setting the value of 'sb-*-auth-token' exceeded the quota"
+ * on mobile browsers (Android Chrome, iOS Safari, WebViews) by:
+ * 1. Proactively migrating bulky UI/feed caches from localStorage to IndexedDB.
+ * 2. Asynchronously persisting Auth tokens in IndexedDB (virtually unlimited capacity)
+ *    and in-memory cache for durable session persistence across reloads.
+ * 3. Never allowing QuotaExceeded exceptions to crash Supabase Auth signUp/signIn.
+ * 4. Intercepting Storage.prototype.setItem so no component can cause unhandled quota crashes.
+ */
+
+// Global memory cache for immediate synchronous access
+const memoryCache: Record<string, string> = {};
+
+class SafeSupabaseStorage {
+  public memoryCache = memoryCache;
+
+  /**
+   * Frees space in localStorage by evicting bulky non-auth cached data.
+   * NEVER deletes auth tokens (sb-*), user accounts, profiles, or financial wallets.
+   * Backs up everything to IndexedDB before removal.
+   */
+  evictHeavyCachesToFreeSpace(): number {
+    if (typeof window === 'undefined' || !window.localStorage) return 0;
+    let freedCount = 0;
+    try {
+      const keysToExamine: { key: string; size: number }[] = [];
+      const len = localStorage.length;
+      for (let i = 0; i < len; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+
+        // NEVER evict Supabase auth tokens or active user sessions
+        if (
+          key.startsWith('sb-') || 
+          key.includes('auth.token') || 
+          key.includes('artisanpro_session') ||
+          key.includes('artisanpro_admin_session')
+        ) {
+          continue;
+        }
+
+        try {
+          const val = localStorage.getItem(key) || '';
+          keysToExamine.push({ key, size: val.length });
+        } catch {}
+      }
+
+      // Sort largest items first to liberate maximum quota instantly
+      keysToExamine.sort((a, b) => b.size - a.size);
+
+      for (const item of keysToExamine) {
+        const k = item.key;
+        try {
+          const val = localStorage.getItem(k);
+          if (val) {
+            // Backup to IndexedDB before removing so nothing is ever lost
+            try {
+              const parsed = JSON.parse(val);
+              idbStorage.setItem(k, parsed).catch(() => {});
+            } catch {
+              idbStorage.setItem(k, val).catch(() => {});
+            }
+          }
+
+          // If it's a single profile, strip bulky base64 data URLs instead of deleting
+          if (k.startsWith('artisanpro_profile_') && val) {
+            try {
+              const prof = JSON.parse(val);
+              if (prof.avatar_url && prof.avatar_url.startsWith('data:') && prof.avatar_url.length > 2000) {
+                prof.avatar_url = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(prof.full_name || 'User')}&backgroundColor=FF6B00`;
+                localStorage.setItem(k, JSON.stringify(prof));
+                freedCount++;
+                continue;
+              }
+            } catch {}
+          }
+
+          // If it's registered_users, strip bulky base64 data URLs
+          if (k === 'artisanpro_registered_users' && val) {
+            try {
+              const users = JSON.parse(val);
+              if (Array.isArray(users)) {
+                const sanitized = users.map((u: any) => {
+                  if (u.avatar_url && u.avatar_url.startsWith('data:') && u.avatar_url.length > 2000) {
+                    return {
+                      ...u,
+                      avatar_url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(u.full_name || 'User')}&backgroundColor=FF6B00`
+                    };
+                  }
+                  return u;
+                });
+                localStorage.setItem(k, JSON.stringify(sanitized));
+                freedCount++;
+                continue;
+              }
+            } catch {}
+          }
+
+          // For feeds, videos, messages, etc. remove from localStorage (already preserved in IndexedDB)
+          localStorage.removeItem(k);
+          freedCount++;
+        } catch {}
+      }
+    } catch (e) {
+      console.warn('Error during localStorage quota recovery:', e);
+    }
+    return freedCount;
+  }
+
+  async getItem(key: string): Promise<string | null> {
+    // 1. In-memory cache first (instant)
+    if (this.memoryCache[key] !== undefined && this.memoryCache[key] !== null) {
+      return this.memoryCache[key];
+    }
+
+    // 2. localStorage
+    if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        const val = localStorage.getItem(key);
+        if (val !== null && val !== undefined) {
+          this.memoryCache[key] = val;
+          return val;
+        }
+      } catch (e) {
+        console.warn('safeSupabaseStorage getItem error:', e);
+      }
+    }
+
+    // 3. Fallback to IndexedDB (multi-gigabyte persistent backup)
+    try {
+      const idbVal = await idbStorage.getItem<string>(key);
+      if (idbVal !== null && idbVal !== undefined) {
+        const stringVal = typeof idbVal === 'string' ? idbVal : JSON.stringify(idbVal);
+        this.memoryCache[key] = stringVal;
+        // Try restoring to localStorage if space is available
+        try {
+          if (typeof window !== 'undefined' && window.localStorage) {
+            localStorage.setItem(key, stringVal);
+          }
+        } catch {}
+        return stringVal;
+      }
+    } catch {}
+
+    return null;
+  }
+
+  async setItem(key: string, value: string): Promise<void> {
+    // 1. Always store in memory cache immediately
+    this.memoryCache[key] = value;
+
+    // 2. Asynchronously persist to IndexedDB (virtually unlimited capacity)
+    try {
+      await idbStorage.setItem(key, value);
+    } catch (idbErr) {
+      console.warn('IndexedDB setItem error:', idbErr);
+    }
+
+    if (typeof window === 'undefined' || !window.localStorage) return;
+
+    // 3. Attempt to save to localStorage
+    try {
+      localStorage.setItem(key, value);
+    } catch (firstErr: any) {
+      console.warn('Supabase Auth token storage hit quota limit. Evicting heavy non-auth caches...', firstErr?.message);
+      this.evictHeavyCachesToFreeSpace();
+
+      try {
+        localStorage.setItem(key, value);
+      } catch (retryErr: any) {
+        console.warn('localStorage still full after cache eviction. Retaining token in memory and IndexedDB without throwing.', retryErr?.message);
+        // CRITICAL: We deliberately do NOT re-throw here.
+        // The token is safely stored in memory and in IndexedDB. Supabase Auth will not crash!
+      }
+    }
+  }
+
+  async removeItem(key: string): Promise<void> {
+    delete this.memoryCache[key];
+    if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        localStorage.removeItem(key);
+      } catch {}
+    }
+    try {
+      await idbStorage.removeItem(key);
+    } catch {}
+  }
+}
+
+export const safeSupabaseStorage = new SafeSupabaseStorage();
+
+// Proactive cleanup immediately on module import
+if (typeof window !== 'undefined' && window.localStorage) {
+  try {
+    safeSupabaseStorage.evictHeavyCachesToFreeSpace();
+  } catch {}
+}
+
+// Global Storage prototype interceptor to prevent any unhandled QuotaExceededError in the app
+if (typeof window !== 'undefined' && window.Storage && !(window as any).__artisanpro_storage_patched__) {
+  (window as any).__artisanpro_storage_patched__ = true;
+  const originalSetItem = window.Storage.prototype.setItem;
+  window.Storage.prototype.setItem = function (key: string, value: string) {
+    try {
+      return originalSetItem.call(this, key, value);
+    } catch (err: any) {
+      const isQuota =
+        err && (
+          err.name === 'QuotaExceededError' ||
+          err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+          err.code === 22 ||
+          err.code === 1014 ||
+          (typeof err.message === 'string' && err.message.toLowerCase().includes('quota'))
+        );
+
+      if (isQuota) {
+        console.warn(`[ArtisanPro Storage] Intercepted QuotaExceededError for key "${key}". Evicting heavy caches...`);
+        safeSupabaseStorage.evictHeavyCachesToFreeSpace();
+
+        try {
+          return originalSetItem.call(this, key, value);
+        } catch (retryErr) {
+          // If still full, ensure auth tokens and critical state are never lost and NEVER crash the UI
+          if (key.startsWith('sb-') || key.includes('auth.token') || key.includes('session')) {
+            console.warn(`[ArtisanPro Storage] Retaining auth key "${key}" safely in memory and IndexedDB without throwing.`);
+            safeSupabaseStorage.memoryCache[key] = value;
+            idbStorage.setItem(key, value).catch(() => {});
+            return;
+          }
+          // For non-auth data, safely fallback to IndexedDB without throwing
+          idbStorage.setItem(key, value).catch(() => {});
+          return;
+        }
+      }
+      throw err;
+    }
+  };
+}

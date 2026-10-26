@@ -1,0 +1,408 @@
+process.env.DISABLE_HMR = 'true';
+
+import express from 'express';
+import http from 'http';
+import fs from 'fs';
+import { createServer as createViteServer } from 'vite';
+import { exec } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createClient } from '@supabase/supabase-js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const SUPABASE_URL = process.env.VITE_SUPABASE_URL || 'https://bdsllohfaslkkupwsvyi.supabase.co';
+const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_5ZZiR7VTlZN16JTonMTQDA_ei7saoDO';
+const ADMIN_EMAIL = 'adanmitondejunior07@gmail.com';
+
+const supabaseAuthClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Verrou d'exclusion mutuelle pour empêcher les requêtes concurrentes
+let isDeployingMutex = false;
+
+async function startServer() {
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+
+  // 1. Normalisation préventive des en-têtes d'encodage pour l'API
+  app.use('/api', (req, _res, next) => {
+    if (req.headers['content-encoding']) {
+      const enc = String(req.headers['content-encoding']).toLowerCase().trim();
+      // Si l'encodage est identité, non compressé ou vestigial, le supprimer pour éviter le rejet 415 par body-parser
+      if (enc === 'identity' || enc === 'none' || enc === '' || enc === 'utf-8' || enc === 'utf8') {
+        delete req.headers['content-encoding'];
+      }
+    }
+    next();
+  });
+
+  // 2. Parser JSON tolérant acceptant application/json, variantes json et text/plain
+  app.use(express.json({
+    limit: '2mb',
+    strict: false,
+    type: ['application/json', 'application/*+json', 'text/plain']
+  }));
+
+  // 3. Gestionnaire d'erreurs de parsing dédié pour l'API (ex: 415 type non supporté, 400 syntaxe JSON)
+  // Garantit qu'une anomalie de parsing renvoie immédiatement un objet JSON propre et jamais de page HTML
+  app.use('/api', (err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+    const status = (typeof err.status === 'number' && err.status >= 400 && err.status < 600)
+      ? err.status
+      : (typeof err.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600)
+        ? err.statusCode
+        : 400;
+
+    const message = err.message || 'Format de requête invalide ou non supporté.';
+    return res.status(status).json({
+      success: false,
+      error: `[Erreur API ${status}] ${message}`
+    });
+  });
+
+  // Endpoint de déploiement sécurisé en mémoire
+  // Ne sauvegarde rien sur disque, ne logge aucun secret
+  app.post('/api/deploy-functions', async (req, res) => {
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch {}
+    }
+    let { token, projectRef } = (body && typeof body === 'object') ? body : {};
+
+    // 1. Contrôle de concurrence
+    if (isDeployingMutex) {
+      return res.status(429).json({
+        success: false,
+        error: 'Un déploiement est déjà en cours d\'exécution. Veuillez patienter.'
+      });
+    }
+
+    // 2. Validation stricte du projet cible (lockdown bdsllohfaslkkupwsvyi)
+    const targetProject = (projectRef || 'bdsllohfaslkkupwsvyi').trim();
+    if (targetProject !== 'bdsllohfaslkkupwsvyi') {
+      return res.status(400).json({
+        success: false,
+        error: 'Projet non autorisé. Seul le projet bdsllohfaslkkupwsvyi est permis.'
+      });
+    }
+
+    // 3. Validation de forme du jeton Supabase personnel (SUPABASE_ACCESS_TOKEN)
+    if (!token || typeof token !== 'string' || token.trim().length < 10) {
+      return res.status(400).json({
+        success: false,
+        error: 'Jeton d\'accès personnel Supabase (SUPABASE_ACCESS_TOKEN) manquant ou invalide.'
+      });
+    }
+
+    const cleanToken = token.trim();
+
+    // 4. Contrôle de sécurité obligatoire côté serveur :
+    // A. Vérification cryptographique de la session Supabase active via auth.getUser(accessToken)
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        error: 'Vous devez être connecté avec votre compte administrateur actif pour exécuter un déploiement.'
+      });
+    }
+
+    const sessionAccessToken = authHeader.replace('Bearer ', '').trim();
+    if (!sessionAccessToken) {
+      return res.status(401).json({
+        success: false,
+        error: 'Vous devez être connecté avec votre compte administrateur actif pour exécuter un déploiement.'
+      });
+    }
+
+    let authenticatedUser: any = null;
+    try {
+      const { data, error } = await supabaseAuthClient.auth.getUser(sessionAccessToken);
+      if (error || !data?.user) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session administrateur expirée ou invalide. Veuillez vous reconnecter avec votre compte administrateur.'
+        });
+      }
+      authenticatedUser = data.user;
+    } catch {
+      return res.status(401).json({
+        success: false,
+        error: 'Impossible de vérifier la session administrateur auprès de Supabase Auth. Veuillez vous reconnecter.'
+      });
+    }
+
+    // B. Validation stricte de l'identité du fondateur : UID 29a23578-640c-434c-bb7c-5b1cb7a30a91 et email adanmitondejunior07@gmail.com
+    const EXPECTED_FOUNDER_UID = '29a23578-640c-434c-bb7c-5b1cb7a30a91';
+    const isFounderUid = authenticatedUser.id === EXPECTED_FOUNDER_UID;
+    const isFounderEmail = Boolean(
+      (authenticatedUser.email && authenticatedUser.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+      (authenticatedUser.user_metadata?.email && String(authenticatedUser.user_metadata.email).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
+    );
+
+    if (!isFounderUid || !isFounderEmail) {
+      return res.status(401).json({
+        success: false,
+        error: 'Accès refusé. Seul le compte administrateur fondateur officiel (adanmitondejunior07@gmail.com) est autorisé à exécuter un déploiement.'
+      });
+    }
+
+    // C. Validation du jeton d'infrastructure personnel directement auprès de l'API de gestion Supabase
+    let isManagementAuthorized = false;
+    try {
+      const mgmtRes = await fetch(`https://api.supabase.com/v1/projects/${targetProject}`, {
+        headers: { Authorization: `Bearer ${cleanToken}` }
+      });
+      if (mgmtRes.ok) {
+        isManagementAuthorized = true;
+      }
+    } catch {
+      // Tolérance réseau
+    }
+
+    if (!isManagementAuthorized) {
+      return res.status(400).json({
+        success: false,
+        error: 'Jeton d\'accès personnel Supabase (SUPABASE_ACCESS_TOKEN) invalide ou non autorisé pour le projet bdsllohfaslkkupwsvyi.'
+      });
+    }
+
+    isDeployingMutex = true;
+
+    // Déploiement successif de create-wallet-recharge puis verify-wallet-recharge
+    // avec --use-api (sans Docker) et ciblant bdsllohfaslkkupwsvyi
+    const cmdCreate = `npx supabase functions deploy create-wallet-recharge --project-ref ${targetProject} --use-api`;
+    const cmdVerify = `npx supabase functions deploy verify-wallet-recharge --project-ref ${targetProject} --use-api`;
+
+    // Fonction d'exécution sécurisée isolée
+    const runDeploy = (cmd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+      return new Promise((resolve) => {
+        exec(
+          cmd,
+          {
+            cwd: __dirname,
+            env: {
+              ...process.env,
+              SUPABASE_ACCESS_TOKEN: cleanToken
+            },
+            timeout: 120000 // 2 minutes max
+          },
+          (error, stdout, stderr) => {
+            // Rédacter tout vestige éventuel du jeton
+            const safeStdout = (stdout || '').replaceAll(cleanToken, '[PROTECTED_TOKEN]');
+            const safeStderr = (stderr || '').replaceAll(cleanToken, '[PROTECTED_TOKEN]');
+            const exitCode = error ? (error.code || 1) : 0;
+            resolve({ stdout: safeStdout, stderr: safeStderr, exitCode });
+          }
+        );
+      });
+    };
+
+    try {
+      const createResult = await runDeploy(cmdCreate);
+      let verifyResult = { stdout: '', stderr: '', exitCode: 0 };
+
+      if (createResult.exitCode === 0) {
+        verifyResult = await runDeploy(cmdVerify);
+      }
+
+      // Effacer la variable locale de la mémoire
+      token = null;
+
+      const isSuccess = createResult.exitCode === 0 && verifyResult.exitCode === 0;
+
+      return res.json({
+        success: isSuccess,
+        projectRef: targetProject,
+        results: {
+          'create-wallet-recharge': createResult,
+          'verify-wallet-recharge': verifyResult
+        }
+      });
+    } catch (err: any) {
+      const safeErrorMsg = (err.message || 'Erreur lors du déploiement').replaceAll(cleanToken, '[PROTECTED_TOKEN]');
+      return res.status(500).json({
+        success: false,
+        error: safeErrorMsg
+      });
+    } finally {
+      isDeployingMutex = false;
+      token = null;
+    }
+  });
+
+  // Health check
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok', project: 'bdsllohfaslkkupwsvyi' });
+  });
+
+  // Catch-all pour les routes API inexistantes afin d'éviter tout repli HTML vers index.html
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({
+      success: false,
+      error: 'Point de terminaison API introuvable.'
+    });
+  });
+
+  // Contrôle de complétude et d'intégrité du build frontend compilé dans dist/
+  function isDistBuildComplete(): boolean {
+    const distPath = path.join(__dirname, 'dist');
+    const distIndexPath = path.join(distPath, 'index.html');
+    const distSwPath = path.join(distPath, 'sw.js');
+    const distManifestPath = path.join(distPath, 'manifest.json');
+    const distAssetsPath = path.join(distPath, 'assets');
+
+    if (!fs.existsSync(distIndexPath) || !fs.existsSync(distSwPath) || !fs.existsSync(distManifestPath) || !fs.existsSync(distAssetsPath)) {
+      return false;
+    }
+
+    try {
+      const htmlContent = fs.readFileSync(distIndexPath, 'utf-8');
+      const jsMatch = htmlContent.match(/src="\/assets\/(index-[a-zA-Z0-9_-]+\.js)"/);
+      const cssMatch = htmlContent.match(/href="\/assets\/(index-[a-zA-Z0-9_-]+\.css)"/);
+      if (!jsMatch || !cssMatch) return false;
+
+      const referencedJs = path.join(distAssetsPath, jsMatch[1]);
+      const referencedCss = path.join(distAssetsPath, cssMatch[1]);
+      return fs.existsSync(referencedJs) && fs.existsSync(referencedCss);
+    } catch {
+      return false;
+    }
+  }
+
+  const shouldServeDist = process.env.NODE_ENV === 'production' || isDistBuildComplete();
+
+  // Service Worker : servir le véritable Service Worker PWA généré dans dist/sw.js
+  // avec interdiction de cache sur le script SW afin que les mises à jour soient détectées immédiatement.
+  app.get('/sw.js', (_req, res, next) => {
+    if (shouldServeDist) {
+      const distSw = path.join(__dirname, 'dist', 'sw.js');
+      if (fs.existsSync(distSw)) {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+        return res.sendFile(distSw);
+      }
+    }
+    // En développement local sans build valide : script neutre de désinscription pour éviter les conflits HMR
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.send(`self.addEventListener('install', () => { self.skipWaiting(); }); self.addEventListener('activate', (e) => { e.waitUntil(self.registration.unregister()); });`);
+  });
+
+  app.get('/dev-sw.js', (_req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.send(`self.addEventListener('install', () => { self.skipWaiting(); }); self.addEventListener('activate', (e) => { e.waitUntil(self.registration.unregister()); });`);
+  });
+
+  const httpServer = http.createServer(app);
+
+  // En dev pur (sans build dist valide) : Vite middlewares avec interception HTML et neutralisation WebSocket
+  if (!shouldServeDist) {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+
+    app.get(['/', '/index.html'], async (req, res, next) => {
+      try {
+        const template = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');
+        let html = await vite.transformIndexHtml(req.originalUrl, template);
+        const wsPreamble = `<script>
+          (function() {
+            window.$RefreshReg$ = window.$RefreshReg$ || function() {};
+            window.$RefreshSig$ = window.$RefreshSig$ || function() { return function(t) { return t; }; };
+            window.__vite_plugin_react_preamble_installed__ = true;
+            const OrigWS = window.WebSocket;
+            if (OrigWS) {
+              window.WebSocket = function(url, protocols) {
+                if (protocols === 'vite-hmr' || (typeof url === 'string' && url.includes('vite'))) {
+                  const mock = new EventTarget();
+                  mock.readyState = 1;
+                  mock.OPEN = 1;
+                  mock.CLOSED = 3;
+                  mock.send = function() {};
+                  mock.close = function() {};
+                  setTimeout(function() { try { mock.dispatchEvent(new Event('open')); } catch(e) {} }, 0);
+                  return mock;
+                }
+                return new OrigWS(url, protocols);
+              };
+              window.WebSocket.prototype = OrigWS.prototype;
+              Object.assign(window.WebSocket, OrigWS);
+            }
+            window.addEventListener('unhandledrejection', function(e) {
+              const m = String(e.reason?.message || e.reason || '');
+              if (m.includes('WebSocket') || m.includes('closed without opened')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+              }
+            }, true);
+            window.addEventListener('error', function(e) {
+              const m = String(e.message || '');
+              if (m.includes('WebSocket') || m.includes('closed without opened')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+              }
+            }, true);
+          })();
+        </script>`;
+        html = html.replace('<head>', '<head>' + wsPreamble);
+        return res.status(200).set({
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+          'Pragma': 'no-cache',
+          'Expires': '0'
+        }).end(html);
+      } catch (e) {
+        next(e);
+      }
+    });
+
+    app.use(vite.middlewares);
+  } else {
+    // En production : distribution des fichiers statiques optimisés avec contrôle du cache
+    const distPath = path.join(__dirname, 'dist');
+    const distIndexPath = path.join(distPath, 'index.html');
+
+    // 1. Assets immuables hachés (dist/assets) : cache navigateur 1 an
+    app.use('/assets', express.static(path.join(distPath, 'assets'), {
+      maxAge: '1y',
+      immutable: true
+    }));
+
+    // 2. Fichiers statiques généraux (icons, manifest) avec interdiction de cache sur index.html
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('index.html')) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+          res.setHeader('Pragma', 'no-cache');
+          res.setHeader('Expires', '0');
+        }
+      }
+    }));
+
+    // 3. Fallback SPA pour toutes les routes HTML : index.html n'est JAMAIS mis en cache
+    app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.sendFile(distIndexPath);
+    });
+  }
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Serveur ArtisanPro actif sur le port ${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Erreur démarrage serveur:', err);
+});

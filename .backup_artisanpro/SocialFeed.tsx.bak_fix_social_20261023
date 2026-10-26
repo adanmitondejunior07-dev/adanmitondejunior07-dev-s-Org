@@ -1,0 +1,950 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Heart, 
+  MessageCircle, 
+  Share2, 
+  Plus, 
+  Sparkles, 
+  Send, 
+  Image, 
+  X, 
+  UserPlus, 
+  UserCheck, 
+  MapPin, 
+  CheckCircle,
+  Video,
+  Camera,
+  Trash2,
+  Pencil,
+  Users
+} from 'lucide-react';
+import { Publication, CommentItem } from '../../types';
+import { dataStore } from '../../lib/dataStore';
+import { useAuth } from '../../context/AuthContext';
+import { ADMIN_EMAIL } from '../../lib/supabase';
+import { copyToClipboard } from '../../lib/utils';
+import { compressImageFile } from '../../lib/mediaCompressor';
+import { HeroCarousel } from '../common/HeroCarousel';
+import { UserProfileModal, PublicUserTarget } from '../common/UserProfileModal';
+import { PostText } from './PostText';
+
+export const SocialFeed: React.FC = () => {
+  const { profile, user } = useAuth();
+
+  // 1. Initialisation instantanée depuis le cache local (0 ms de délai)
+  const [publications, setPublications] = useState<Publication[]>(() => {
+    try {
+      return dataStore.getCachedPublicationsSync(user?.id);
+    } catch {
+      return [];
+    }
+  });
+
+  // Afficher les blocs gris uniquement si AUCUNE publication n'est encore disponible
+  const [loading, setLoading] = useState<boolean>(() => {
+    try {
+      const cached = dataStore.getCachedPublicationsSync(user?.id);
+      return cached.length === 0;
+    } catch {
+      return true;
+    }
+  });
+
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const isMountedRef = useRef(true);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
+  // Gallery file input reference
+  const mediaFileInputRef = useRef<HTMLInputElement>(null);
+
+  // New Post state
+  const [newContent, setNewContent] = useState('');
+  const [newMediaUrl, setNewMediaUrl] = useState('');
+  const [newMediaType, setNewMediaType] = useState<'image' | 'video'>('image');
+  const [isPosting, setIsPosting] = useState(false);
+
+  // Comments state
+  const [activeCommentsPostId, setActiveCommentsPostId] = useState<string | null>(null);
+  const [commentsMap, setCommentsMap] = useState<Record<string, CommentItem[]>>({});
+  const [newCommentText, setNewCommentText] = useState('');
+  const [isSendingComment, setIsSendingComment] = useState(false);
+
+  // Follows state
+  const [followedAuthors, setFollowedAuthors] = useState<Set<string>>(new Set());
+
+  // Toast feedback
+  const [toastMessage, setToastMessage] = useState('');
+
+  // Selected Author for Public Profile Modal
+  const [selectedAuthor, setSelectedAuthor] = useState<PublicUserTarget | null>(null);
+
+  const handleOpenAuthorProfile = (pub: Publication) => {
+    setSelectedAuthor({
+      id: pub.user_id || pub.artisan_name,
+      full_name: pub.artisan_name,
+      avatar_url: pub.artisan_avatar,
+      ville: pub.location?.split(',')[0]?.trim() || 'Abidjan',
+      pays: pub.location?.split(',')[1]?.trim() || 'Afrique',
+      role: 'artisan'
+    });
+  };
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(''), 2500);
+  };
+
+  const hasLoadedRef = useRef(false);
+
+  const loadPosts = async (isRetry = false) => {
+    if (isRetry && publications.length === 0) {
+      setLoadError(null);
+      setLoading(true);
+    }
+    try {
+      const pubs = await dataStore.getPublications(user?.id);
+      if (!isMountedRef.current) return;
+      if (pubs && pubs.length > 0) {
+        setPublications(pubs);
+      }
+      setLoadError(null);
+      if (user?.id) {
+        const follows = dataStore.getFollowedUsers(user.id);
+        setFollowedAuthors(new Set(follows));
+      } else {
+        setFollowedAuthors(new Set());
+      }
+    } catch (e: any) {
+      if (!isMountedRef.current) return;
+      console.warn('Erreur chargement fil social:', e);
+      // Ne jamais supprimer les publications locales existantes
+      if (publications.length === 0) {
+        setLoadError('Connexion lente ou indisponible. Vos données locales sont préservées.');
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    const isFirst = !hasLoadedRef.current;
+    hasLoadedRef.current = true;
+    loadPosts(isFirst);
+
+    const handleProfileUpdated = (e: any) => {
+      const { userId, fullName, avatarUrl } = e.detail || {};
+      if (fullName) {
+        setPublications(prev => prev.map(p => {
+          const isMe = (userId && p.user_id === userId) || (user?.id && p.user_id === user.id) || (profile?.full_name && p.artisan_name === profile.full_name);
+          if (isMe) {
+            return {
+              ...p,
+              artisan_name: fullName,
+              artisan_avatar: avatarUrl || p.artisan_avatar
+            };
+          }
+          return p;
+        }));
+      }
+    };
+
+    window.addEventListener('artisanpro_profile_updated' as any, handleProfileUpdated);
+    return () => {
+      isMountedRef.current = false;
+      window.removeEventListener('artisanpro_profile_updated' as any, handleProfileUpdated);
+    };
+  }, [user?.id]);
+
+  const handleLike = async (postId: string) => {
+    if (!user) {
+      showToast('Connectez-vous pour aimer cette publication');
+      return;
+    }
+
+    const currentPost = publications.find(p => p.id === postId);
+    if (!currentPost) return;
+
+    const previousLiked = Boolean(currentPost.is_liked_by_me);
+    const previousCount = Number(currentPost.likes_count || 0);
+
+    const nextLiked = !previousLiked;
+    const nextCount = nextLiked ? previousCount + 1 : Math.max(0, previousCount - 1);
+
+    // 1. Mise à jour optimiste immédiate dans l'interface (0 ms d'attente)
+    setPublications(prev =>
+      prev.map(p => (p.id === postId ? { ...p, is_liked_by_me: nextLiked, likes_count: nextCount } : p))
+    );
+
+    try {
+      // 2. Synchronisation et confirmation Supabase via dataStore
+      const res = await dataStore.toggleLike(postId, user.id);
+      setPublications(prev =>
+        prev.map(p => {
+          if (p.id === postId) {
+            return {
+              ...p,
+              is_liked_by_me: res.isLiked,
+              likes_count: res.count
+            };
+          }
+          return p;
+        })
+      );
+    } catch (err) {
+      // 3. Rollback en cas d'échec réseau
+      setPublications(prev =>
+        prev.map(p => (p.id === postId ? { ...p, is_liked_by_me: previousLiked, likes_count: previousCount } : p))
+      );
+      showToast('Erreur lors de l\'enregistrement de votre mention J\'aime');
+    }
+  };
+
+  const handleToggleComments = async (postId: string) => {
+    if (activeCommentsPostId === postId) {
+      setActiveCommentsPostId(null);
+      return;
+    }
+    setActiveCommentsPostId(postId);
+    if (!commentsMap[postId]) {
+      const c = await dataStore.getComments(postId);
+      setCommentsMap(prev => ({ ...prev, [postId]: c }));
+    }
+  };
+
+  const handleSendComment = async (postId: string) => {
+    if (!newCommentText.trim()) return;
+    setIsSendingComment(true);
+
+    const userName = profile?.full_name || 'Utilisateur ArtisanPro';
+    const userId = user?.id || 'anon';
+
+    try {
+      const added = await dataStore.addComment(postId, userId, userName, newCommentText.trim());
+      setCommentsMap(prev => ({
+        ...prev,
+        [postId]: [...(prev[postId] || []), added]
+      }));
+      setPublications(prev =>
+        prev.map(p => p.id === postId ? { ...p, comments_count: (p.comments_count || 0) + 1 } : p)
+      );
+      setNewCommentText('');
+    } finally {
+      setIsSendingComment(false);
+    }
+  };
+
+  const handleShare = async (pub: Publication) => {
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: `ArtisanPro Afrique: ${pub.artisan_name}`,
+          text: pub.content,
+          url: window.location.href
+        });
+        return;
+      } catch (e) {
+        // User cancelled or unsupported
+      }
+    }
+    const shareText = `${window.location.origin} - ${pub.artisan_name}: ${pub.content.slice(0, 80)}...`;
+    await copyToClipboard(shareText);
+    showToast('Lien de la publication copié !');
+  };
+
+  const handleToggleFollow = (authorName: string, authorId?: string) => {
+    if (!user) {
+      showToast('Connectez-vous pour suivre cet artisan');
+      return;
+    }
+    const resolvedMyId = dataStore.resolveUserUuid(user.id) || user.id;
+    const targetKey = authorId || authorName;
+    if (resolvedMyId === targetKey || (authorId && resolvedMyId === authorId)) {
+      showToast('Vous ne pouvez pas vous suivre vous-même');
+      return;
+    }
+    const res = dataStore.toggleFollowUser(targetKey, user.id);
+
+    setFollowedAuthors(prev => {
+      const next = new Set(prev);
+      if (res.isFollowed) {
+        next.add(authorName);
+        next.add(targetKey);
+        if (authorId) next.add(authorId);
+      } else {
+        next.delete(authorName);
+        next.delete(targetKey);
+        if (authorId) next.delete(authorId);
+      }
+      return next;
+    });
+    showToast(res.isFollowed ? `Vous suivez désormais ${authorName} !` : `Vous ne suivez plus ${authorName}`);
+  };
+
+  // Edit post state
+  const [editingPost, setEditingPost] = useState<Publication | null>(null);
+  const [editContent, setEditContent] = useState('');
+  const [editMediaUrl, setEditMediaUrl] = useState('');
+  const [editMediaType, setEditMediaType] = useState<'image' | 'video'>('image');
+  const [isUpdatingPost, setIsUpdatingPost] = useState(false);
+  const editFileInputRef = useRef<HTMLInputElement>(null);
+
+  const canManagePost = (pub: Publication) => {
+    const isAdmin = profile?.role === 'admin' || user?.email === ADMIN_EMAIL;
+    const isMyPost = Boolean(
+      (user?.id && pub.user_id === user.id) ||
+      (profile?.full_name && pub.artisan_name === profile.full_name)
+    );
+    return isAdmin || isMyPost;
+  };
+
+  const handleOpenEditPost = (pub: Publication) => {
+    setEditingPost(pub);
+    setEditContent(pub.content || '');
+    setEditMediaUrl(pub.media_url || '');
+    setEditMediaType((pub.media_type as 'image' | 'video') || 'image');
+  };
+
+  const handleSaveEditPost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingPost || !editContent.trim()) return;
+    setIsUpdatingPost(true);
+    try {
+      const updated = await dataStore.updatePublication(editingPost.id, {
+        content: editContent.trim(),
+        media_url: editMediaUrl.trim() || null,
+        media_type: editMediaType
+      });
+      if (updated) {
+        setPublications(prev => prev.map(p => p.id === editingPost.id ? { ...p, ...updated } : p));
+        showToast('Publication modifiée avec succès !');
+        setEditingPost(null);
+      }
+    } finally {
+      setIsUpdatingPost(false);
+    }
+  };
+
+  const handleEditMediaFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const isVideo = file.type.startsWith('video/');
+    setEditMediaType(isVideo ? 'video' : 'image');
+
+    const dataUrl = await compressImageFile(file, 1200, 0.82);
+    if (dataUrl) {
+      setEditMediaUrl(dataUrl);
+      showToast(isVideo ? 'Nouvelle vidéo sélectionnée !' : 'Nouvelle photo sélectionnée !');
+    }
+    e.target.value = '';
+  };
+
+  const handleDeletePublication = async (pubId: string) => {
+    if (!window.confirm('Voulez-vous vraiment supprimer cette publication ?')) return;
+    try {
+      await dataStore.deletePublication(pubId);
+      setPublications(prev => prev.filter(p => p.id !== pubId));
+      showToast('Publication supprimée avec succès !');
+    } catch (err) {
+      console.error('Error deleting publication:', err);
+    }
+  };
+
+  // Quick sample photo presets for 1-click publication without copying URLs
+  const CRAFT_PRESETS = [
+    { label: 'Menuiserie', url: 'https://images.unsplash.com/photo-1538688525198-9b88f6f53126?auto=format&fit=crop&w=600&q=80', type: 'image' as const },
+    { label: 'Couture', url: 'https://images.unsplash.com/photo-1594633312681-425c7b97ccd1?auto=format&fit=crop&w=600&q=80', type: 'image' as const },
+    { label: 'Électricité', url: 'https://images.unsplash.com/photo-1621905251189-08b45d6a269e?auto=format&fit=crop&w=600&q=80', type: 'image' as const },
+    { label: 'Mécanique', url: 'https://images.unsplash.com/photo-1619642751034-765dfdf7c58e?auto=format&fit=crop&w=600&q=80', type: 'image' as const }
+  ];
+
+  const handleMediaFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const isVideo = file.type.startsWith('video/');
+    setNewMediaType(isVideo ? 'video' : 'image');
+
+    const dataUrl = await compressImageFile(file, 1200, 0.82);
+    if (dataUrl) {
+      setNewMediaUrl(dataUrl);
+      showToast(isVideo ? 'Vidéo sélectionnée depuis votre galerie !' : 'Photo sélectionnée depuis votre galerie !');
+    }
+    e.target.value = '';
+  };
+
+  const handleCreatePost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newContent.trim()) return;
+
+    if (user?.id && dataStore.isUserSuspended(user.id)) {
+      const reason = dataStore.getSuspensionReason(user.id);
+      alert(`Votre compte a été suspendu (${reason}). Impossible de publier.`);
+      return;
+    }
+
+    setIsPosting(true);
+    const authorName = profile?.full_name || 'Artisan Indépendant';
+    const location = profile?.ville ? `${profile.ville}, ${profile.pays || 'Afrique'}` : 'Afrique';
+
+    try {
+      const created = await dataStore.createPublication({
+        artisan_name: authorName,
+        artisan_avatar: profile?.avatar_url || null,
+        location: location,
+        content: newContent.trim(),
+        media_url: newMediaUrl.trim() || null,
+        media_type: newMediaType,
+        user_id: user?.id
+      });
+
+      setPublications(prev => [created, ...prev]);
+      setShowCreateModal(false);
+      setNewContent('');
+      setNewMediaUrl('');
+      showToast('Publication partagée avec succès !');
+    } finally {
+      setIsPosting(false);
+    }
+  };
+
+  return (
+    <div className="pb-24 pt-2 overflow-x-hidden selection:bg-[#FF6B00] selection:text-white">
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-neutral-900 text-white text-xs font-semibold px-4 py-2 rounded-full shadow-xl animate-in fade-in slide-in-from-top-2">
+          {toastMessage}
+        </div>
+      )}
+
+      {/* African Craftsmanship Hero Carousel */}
+      <HeroCarousel />
+
+      {/* Header banner / Quick create triggers with 2 distinct + buttons for Posts and Videos */}
+      <div className="w-[92%] mx-auto mb-4 space-y-2">
+        <div className="bg-white p-3 rounded-2xl border border-neutral-200/80 shadow-xs flex items-center gap-2.5">
+          <img
+            src={profile?.avatar_url || 'https://api.dicebear.com/7.x/initials/svg?seed=Moi&backgroundColor=FF6B00'}
+            alt="Moi"
+            className="w-9 h-9 rounded-full object-cover border border-neutral-200 shrink-0"
+          />
+          <button
+            onClick={() => {
+              setNewMediaType('image');
+              setShowCreateModal(true);
+            }}
+            className="flex-1 py-2 px-3 rounded-xl bg-neutral-100 hover:bg-neutral-200/70 text-left text-neutral-500 text-xs font-medium transition-colors cursor-pointer truncate"
+          >
+            Partagez une réalisation ou posez une question...
+          </button>
+          
+          {/* Bouton + pour Photo / Post standard */}
+          <button
+            onClick={() => {
+              setNewMediaType('image');
+              setShowCreateModal(true);
+            }}
+            className="px-2.5 py-1.5 rounded-xl bg-neutral-900 hover:bg-black text-white text-[11px] font-bold flex items-center gap-1 shrink-0 shadow-xs cursor-pointer transition-all active:scale-95"
+            title="Publier un post ou une photo"
+          >
+            <Plus className="w-3.5 h-3.5 text-[#FF6B00]" />
+            <span className="hidden xs:inline">Post</span>
+          </button>
+
+          {/* Bouton + pour publier Vidéo */}
+          <button
+            onClick={() => {
+              setNewMediaType('video');
+              setShowCreateModal(true);
+              setTimeout(() => {
+                mediaFileInputRef.current?.click();
+              }, 150);
+            }}
+            className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-[#FF6B00] to-[#FF8C38] hover:from-[#e05e00] hover:to-[#e05e00] text-white text-[11px] font-extrabold flex items-center gap-1 shrink-0 shadow-xs shadow-[#FF6B00]/25 cursor-pointer transition-all active:scale-95"
+            title="Publier une vidéo"
+          >
+            <Plus className="w-3.5 h-3.5 stroke-[3]" />
+            <Video className="w-3.5 h-3.5" />
+            <span>+ Vidéo</span>
+          </button>
+        </div>
+      </div>
+
+      {/* FEED DE CARTES VERTICALES - EXACTEMENT 92% DE LARGEUR, PAS DE DÉBORDEMENT */}
+      {loading && publications.length === 0 ? (
+        <div className="w-[92%] mx-auto space-y-4">
+          {[1, 2].map(n => (
+            <div key={n} className="bg-white rounded-3xl p-5 border border-neutral-200 animate-pulse">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-11 h-11 bg-neutral-200 rounded-full" />
+                <div className="space-y-2 flex-1">
+                  <div className="w-32 h-4 bg-neutral-200 rounded-sm" />
+                  <div className="w-20 h-3 bg-neutral-200 rounded-sm" />
+                </div>
+              </div>
+              <div className="h-4 bg-neutral-200 rounded-sm w-3/4 mb-3" />
+              <div className="h-44 bg-neutral-200 rounded-2xl w-full" />
+            </div>
+          ))}
+        </div>
+      ) : loadError && publications.length === 0 ? (
+        <div className="w-[92%] mx-auto text-center py-8 bg-white rounded-3xl border border-neutral-200 p-6">
+          <p className="text-xs text-neutral-600 mb-3">{loadError}</p>
+          <button
+            onClick={() => loadPosts(true)}
+            className="py-2.5 px-5 rounded-xl bg-[#FF6B00] text-white font-bold text-xs hover:bg-[#e05e00] transition-colors cursor-pointer"
+          >
+            Réessayer
+          </button>
+        </div>
+      ) : publications.length === 0 ? (
+        <div className="w-[92%] mx-auto text-center py-12 bg-white rounded-3xl border border-neutral-200 p-6">
+          <Sparkles className="w-8 h-8 text-[#FF6B00] mx-auto mb-2" />
+          <h3 className="font-bold text-neutral-800 text-base mb-1">Aucune publication pour le moment</h3>
+          <p className="text-xs text-neutral-500 mb-4">Soyez le premier à présenter une réalisation artisanale !</p>
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="py-2.5 px-5 rounded-xl bg-[#FF6B00] text-white font-bold text-xs cursor-pointer"
+          >
+            Créer la première publication
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {publications.map((pub) => {
+            const isFollowed = followedAuthors.has(pub.artisan_name) || Boolean(pub.user_id && followedAuthors.has(pub.user_id));
+            const comments = commentsMap[pub.id] || [];
+
+            return (
+              <article
+                key={pub.id}
+                className="w-[92%] mx-auto bg-white rounded-3xl border border-neutral-200/80 shadow-xs hover:shadow-md transition-shadow duration-200 overflow-hidden"
+              >
+                {/* Post Author Bar */}
+                <div className="p-4 pb-3 flex items-center justify-between">
+                  <div 
+                    onClick={() => handleOpenAuthorProfile(pub)}
+                    className="flex items-center gap-3 min-w-0 cursor-pointer group"
+                    title="Voir le profil de l'auteur"
+                  >
+                    <img
+                      src={
+                        pub.artisan_avatar ||
+                        `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(pub.artisan_name)}&backgroundColor=FF6B00`
+                      }
+                      alt={pub.artisan_name}
+                      className="w-11 h-11 rounded-full object-cover border border-neutral-100 shrink-0 group-hover:scale-105 transition-transform"
+                    />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <h2 className="font-extrabold text-sm text-neutral-900 truncate group-hover:text-[#FF6B00] transition-colors">
+                          {pub.artisan_name}
+                        </h2>
+                        <span title="Vérifié">
+                          <CheckCircle className="w-3.5 h-3.5 text-[#FF6B00] fill-orange-50 shrink-0" />
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[11px] text-neutral-500 truncate">
+                        <MapPin className="w-3 h-3 text-neutral-400 shrink-0" />
+                        <span>{pub.location || 'Afrique'}</span>
+                        <span>•</span>
+                        <span>{new Date(pub.created_at).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Action buttons: Follow (Suivre) & Delete publication */}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {/* Bouton Suivre : bascule interactive entre "Suivre" et "Suivi(e)" (masqué uniquement pour ses propres publications) */}
+                    {(!user?.id || (pub.user_id !== user.id && profile?.full_name !== pub.artisan_name && profile?.id !== pub.user_id)) && (
+                      <button
+                        onClick={() => handleToggleFollow(pub.artisan_name, pub.user_id)}
+                        className={`px-3 py-1.5 rounded-full text-xs font-bold transition-all cursor-pointer shrink-0 flex items-center gap-1.5 active:scale-95 ${
+                          isFollowed
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/80 hover:bg-emerald-100/70'
+                            : 'bg-[#FF6B00] hover:bg-[#e05e00] text-white shadow-md shadow-[#FF6B00]/25'
+                        }`}
+                        title={isFollowed ? "Vous suivez cet artisan (Cliquer pour vous désabonner)" : "Suivre cet artisan"}
+                      >
+                        {isFollowed ? (
+                          <>
+                            <UserCheck className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Suivi(e)</span>
+                          </>
+                        ) : (
+                          <>
+                            <UserPlus className="w-3.5 h-3.5" />
+                            <span>Suivre</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+
+                    {/* BOUTONS MODIFIER & SUPPRIMER (RÉSERVÉ À L'AUTEUR OU À L'ADMINISTRATEUR) */}
+                    {canManagePost(pub) && (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => handleOpenEditPost(pub)}
+                          className="p-1.5 text-neutral-400 hover:text-[#FF6B00] hover:bg-orange-50 rounded-xl transition-colors cursor-pointer"
+                          title="Modifier la publication"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDeletePublication(pub.id)}
+                          className="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors cursor-pointer"
+                          title={profile?.role === 'admin' ? "Supprimer la publication (Admin)" : "Supprimer ma publication"}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Content text */}
+                <div className="px-4 pb-3">
+                  <PostText content={pub.content} />
+                </div>
+
+                {/* Media Image / Video */}
+                {pub.media_url && (
+                  <div className="px-4 pb-3">
+                    <div className="rounded-2xl overflow-hidden bg-neutral-900 max-h-96 relative flex items-center justify-center">
+                      {pub.media_type === 'video' ? (
+                        <video
+                          src={pub.media_url}
+                          controls
+                          playsInline
+                          preload="metadata"
+                          className="w-full max-h-96 object-contain bg-black"
+                        />
+                      ) : (
+                        <img
+                          src={pub.media_url}
+                          alt="Réalisation"
+                          loading="lazy"
+                          className="w-full max-h-96 object-cover"
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Action Footer: Like, Comment, Share */}
+                <div className="px-4 py-3 border-t border-neutral-100 flex items-center justify-between text-xs font-semibold text-neutral-600">
+                  <div className="flex items-center gap-4">
+                    {/* Like */}
+                    <button
+                      onClick={() => handleLike(pub.id)}
+                      className={`flex items-center gap-1.5 transition-colors cursor-pointer ${
+                        pub.is_liked_by_me ? 'text-red-600 font-bold' : 'hover:text-red-500'
+                      }`}
+                    >
+                      <Heart
+                        className={`w-5 h-5 ${
+                          pub.is_liked_by_me ? 'fill-red-600 text-red-600' : ''
+                        }`}
+                      />
+                      <span>{pub.likes_count || 0}</span>
+                    </button>
+
+                    {/* Comment */}
+                    <button
+                      onClick={() => handleToggleComments(pub.id)}
+                      className="flex items-center gap-1.5 hover:text-neutral-900 transition-colors cursor-pointer"
+                    >
+                      <MessageCircle className="w-5 h-5" />
+                      <span>{pub.comments_count || comments.length || 0}</span>
+                    </button>
+                  </div>
+
+                  {/* Share */}
+                  <button
+                    onClick={() => handleShare(pub)}
+                    className="flex items-center gap-1 hover:text-[#FF6B00] transition-colors cursor-pointer"
+                  >
+                    <Share2 className="w-4 h-4" />
+                    <span>Partager</span>
+                  </button>
+                </div>
+
+                {/* Comments Panel */}
+                {activeCommentsPostId === pub.id && (
+                  <div className="p-4 bg-neutral-50/80 border-t border-neutral-100 space-y-3">
+                    <div className="space-y-2 max-h-52 overflow-y-auto">
+                      {comments.length === 0 ? (
+                        <p className="text-[11px] text-neutral-500 text-center py-2">
+                          Aucun commentaire pour le moment. Soyez le premier !
+                        </p>
+                      ) : (
+                        comments.map(c => (
+                          <div key={c.id} className="bg-white p-2.5 rounded-xl border border-neutral-200/70 text-xs">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="font-bold text-neutral-900">{c.user_name}</span>
+                              <span className="text-[10px] text-neutral-400">
+                                {new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            </div>
+                            <p className="text-neutral-700">{c.comment_text}</p>
+                          </div>
+                        ))
+                      )}
+                    </div>
+
+                    {/* New Comment Input */}
+                    <div className="flex items-center gap-2 pt-1">
+                      <input
+                        type="text"
+                        value={newCommentText}
+                        onChange={(e) => setNewCommentText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleSendComment(pub.id);
+                        }}
+                        placeholder="Écrire un commentaire..."
+                        className="flex-1 px-3 py-2 text-xs rounded-xl bg-white border border-neutral-300 focus:outline-hidden focus:border-[#FF6B00]"
+                      />
+                      <button
+                        onClick={() => handleSendComment(pub.id)}
+                        disabled={isSendingComment || !newCommentText.trim()}
+                        className="p-2 rounded-xl bg-[#FF6B00] hover:bg-[#e05e00] disabled:opacity-50 text-white cursor-pointer"
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      {/* CREATE PUBLICATION MODAL */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl border border-neutral-100 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-4 border-b border-neutral-100 flex items-center justify-between">
+              <h3 className="font-bold text-neutral-900 text-base">Créer une publication</h3>
+              <button
+                onClick={() => setShowCreateModal(false)}
+                className="w-8 h-8 rounded-full bg-neutral-100 hover:bg-neutral-200 flex items-center justify-center text-neutral-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreatePost} className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                  Votre message ou description *
+                </label>
+                <textarea
+                  rows={4}
+                  required
+                  value={newContent}
+                  onChange={(e) => setNewContent(e.target.value)}
+                  placeholder="Présentez votre chantier, une création ou demandez des avis à la communauté..."
+                  className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-hidden focus:border-[#FF6B00] resize-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-neutral-700 mb-1.5">
+                  Média (Photo ou Vidéo de votre travail)
+                </label>
+
+                {/* Hidden File Picker */}
+                <input
+                  ref={mediaFileInputRef}
+                  type="file"
+                  accept="image/*,video/*"
+                  onChange={handleMediaFilePicked}
+                  className="hidden"
+                />
+
+                {/* Direct Gallery Button with + icon */}
+                <button
+                  type="button"
+                  onClick={() => mediaFileInputRef.current?.click()}
+                  className="w-full py-3.5 px-4 rounded-2xl bg-orange-50 hover:bg-orange-100 border-2 border-dashed border-[#FF6B00]/50 text-[#FF6B00] text-xs font-extrabold flex items-center justify-center gap-2 cursor-pointer transition-colors mb-2.5 shadow-xs"
+                >
+                  <Plus className="w-4 h-4 stroke-[3]" />
+                  <span>+ Ouvrir ma Galerie (Photo ou Vidéo)</span>
+                </button>
+
+                {/* Live Preview if media selected */}
+                {newMediaUrl ? (
+                  <div className="relative rounded-2xl overflow-hidden bg-neutral-100 border border-neutral-200 mb-2">
+                    {newMediaType === 'video' ? (
+                      <video src={newMediaUrl} controls className="w-full max-h-48 object-cover" />
+                    ) : (
+                      <img src={newMediaUrl} alt="Aperçu" className="w-full max-h-48 object-cover" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setNewMediaUrl('')}
+                      className="absolute top-2 right-2 p-1.5 rounded-full bg-black/60 hover:bg-black/80 text-white cursor-pointer"
+                      title="Supprimer le média"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <span className="text-[10px] text-neutral-400 font-medium block mb-1.5">
+                      Ou choisissez une illustration artisanale en 1 clic :
+                    </span>
+                    <div className="grid grid-cols-4 gap-2">
+                      {CRAFT_PRESETS.map((preset, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setNewMediaUrl(preset.url);
+                            setNewMediaType('image');
+                          }}
+                          className="relative rounded-xl overflow-hidden aspect-square border border-neutral-200 hover:border-[#FF6B00] transition-all cursor-pointer group"
+                        >
+                          <img src={preset.url} alt={preset.label} className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
+                          <span className="absolute inset-x-0 bottom-0 bg-black/60 text-white text-[9px] font-bold text-center py-0.5 truncate px-1">
+                            {preset.label}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  disabled={isPosting || !newContent.trim()}
+                  className="w-full py-3.5 px-6 rounded-2xl bg-[#FF6B00] hover:bg-[#e05e00] disabled:opacity-50 text-white font-bold text-sm shadow-md shadow-[#FF6B00]/25 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {isPosting ? 'Publication en cours...' : 'Publier maintenant'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* EDIT PUBLICATION MODAL */}
+      {editingPost && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className="bg-white rounded-3xl p-5 max-w-md w-full shadow-2xl border border-neutral-100 max-h-[92vh] overflow-y-auto animate-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between pb-3 border-b border-neutral-100 mb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-orange-100 text-[#FF6B00] flex items-center justify-center">
+                  <Pencil className="w-4 h-4" />
+                </div>
+                <h3 className="font-extrabold text-base text-neutral-900">Modifier la publication</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingPost(null)}
+                className="w-7 h-7 rounded-full bg-neutral-100 hover:bg-neutral-200 text-neutral-600 flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditPost} className="space-y-3">
+              <input
+                type="file"
+                ref={editFileInputRef}
+                onChange={handleEditMediaFilePicked}
+                accept="image/*,video/*"
+                className="hidden"
+              />
+
+              <div>
+                <label className="block text-xs font-bold text-neutral-700 mb-1">
+                  Texte de votre publication :
+                </label>
+                <textarea
+                  rows={4}
+                  required
+                  value={editContent}
+                  onChange={(e) => setEditContent(e.target.value)}
+                  placeholder="Modifier le texte ou la description..."
+                  className="w-full p-3 rounded-2xl bg-neutral-50 border border-neutral-200 text-xs focus:outline-hidden focus:border-[#FF6B00]"
+                />
+              </div>
+
+              {/* Photo / Vidéo Changer */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-bold text-neutral-700">
+                    Média attaché ({editMediaType === 'video' ? 'Vidéo' : 'Photo'}) :
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => editFileInputRef.current?.click()}
+                    className="text-xs font-bold text-[#FF6B00] hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>Remplacer depuis la galerie</span>
+                  </button>
+                </div>
+
+                {editMediaUrl ? (
+                  <div className="relative rounded-2xl overflow-hidden bg-neutral-900 border border-neutral-200 mb-2 max-h-48 flex items-center justify-center">
+                    {editMediaType === 'video' ? (
+                      <video src={editMediaUrl} controls className="w-full max-h-48 object-contain bg-black" />
+                    ) : (
+                      <img src={editMediaUrl} alt="Aperçu" className="w-full max-h-48 object-cover" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setEditMediaUrl('')}
+                      className="absolute top-2 right-2 p-1.5 rounded-full bg-black/70 hover:bg-black text-white cursor-pointer"
+                      title="Retirer le média"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <div 
+                    onClick={() => editFileInputRef.current?.click()}
+                    className="p-4 rounded-2xl border-2 border-dashed border-neutral-200 text-center cursor-pointer hover:border-[#FF6B00] transition-colors"
+                  >
+                    <Image className="w-6 h-6 text-neutral-400 mx-auto mb-1" />
+                    <span className="text-xs font-bold text-neutral-600 block">Cliquez pour ajouter une photo ou vidéo</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditingPost(null)}
+                  className="py-2.5 px-4 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-bold text-xs cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdatingPost || !editContent.trim()}
+                  className="py-2.5 px-4 rounded-xl bg-[#FF6B00] hover:bg-[#e05e00] text-white font-bold text-xs shadow-md shadow-[#FF6B00]/20 cursor-pointer"
+                >
+                  {isUpdatingPost ? 'Enregistrement...' : 'Enregistrer'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* AUTHOR PUBLIC PROFILE MODAL */}
+      <UserProfileModal
+        user={selectedAuthor}
+        onClose={() => setSelectedAuthor(null)}
+      />
+    </div>
+  );
+};

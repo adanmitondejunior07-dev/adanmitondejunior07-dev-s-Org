@@ -1,0 +1,6 @@
+{
+  "name": "ArtisanPro Afrique",
+  "description": "Plateforme professionnelle des artisans d'Afrique - Trouvez un artisan près de vous",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

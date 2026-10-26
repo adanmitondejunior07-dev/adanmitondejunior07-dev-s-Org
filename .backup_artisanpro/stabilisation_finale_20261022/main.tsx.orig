@@ -1,0 +1,34 @@
+// Preamble fallback for React Fast Refresh
+if (typeof window !== 'undefined') {
+  (window as any).$RefreshReg$ = (window as any).$RefreshReg$ || function () {};
+  (window as any).$RefreshSig$ = (window as any).$RefreshSig$ || function () { return function (type: any) { return type; }; };
+  (window as any).__vite_plugin_react_preamble_installed__ = true;
+}
+
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+// Enregistrement unique et sécurisé du Service Worker PWA en mode production
+if (import.meta.env.PROD && typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then((registration) => {
+        registration.addEventListener('updatefound', () => {
+          const newWorker = registration.installing;
+          if (newWorker) {
+            newWorker.addEventListener('statechange', () => {
+              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                console.log('ArtisanPro: Nouvelle version prête');
+              }
+            });
+          }
+        });
+      })
+      .catch((err) => {
+        console.warn('PWA Service Worker note:', err);
+      });
+  });
+}
+
+createRoot(document.getElementById('root')!).render(<App />);

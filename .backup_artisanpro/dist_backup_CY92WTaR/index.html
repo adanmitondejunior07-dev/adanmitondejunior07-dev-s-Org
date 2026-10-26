@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <script>
+      // Synchronous React Refresh preamble to satisfy @vitejs/plugin-react
+      window.$RefreshReg$ = window.$RefreshReg$ || function() {};
+      window.$RefreshSig$ = window.$RefreshSig$ || function() { return function(type) { return type; }; };
+      window.__vite_plugin_react_preamble_installed__ = true;
+
+      // Storage Quota Guardian: Prevent QuotaExceededError on mobile browsers (Android Chrome, iOS)
+      (function() {
+        try {
+          if (window.Storage && !window.__artisanpro_storage_pre_patched__) {
+            window.__artisanpro_storage_pre_patched__ = true;
+            const origSet = window.Storage.prototype.setItem;
+            window.Storage.prototype.setItem = function(k, v) {
+              try {
+                return origSet.call(this, k, v);
+              } catch (err) {
+                const isQ = err && (err.name === 'QuotaExceededError' || err.code === 22 || (err.message && String(err.message).toLowerCase().includes('quota')));
+                if (isQ && (String(k).startsWith('sb-') || String(k).includes('auth.token') || String(k).includes('session'))) {
+                  console.warn('Early storage guardian handled quota on auth token:', k);
+                  return; // Never let auth token setItem crash the page
+                }
+                throw err;
+              }
+            };
+          }
+        } catch(e) {}
+      })();
+
+      // Suppress Vite HMR WebSocket connection closed warning in AI Studio preview environment
+      (function() {
+        const OrigWS = window.WebSocket;
+        if (OrigWS) {
+          window.WebSocket = function(url, protocols) {
+            const ws = new OrigWS(url, protocols);
+            if (protocols === 'vite-hmr' || (typeof url === 'string' && url.includes('vite'))) {
+              ws.addEventListener('error', function(e) {
+                e.preventDefault?.();
+                e.stopImmediatePropagation?.();
+              }, true);
+            }
+            return ws;
+          };
+          window.WebSocket.prototype = OrigWS.prototype;
+          Object.assign(window.WebSocket, OrigWS);
+        }
+
+        window.addEventListener('unhandledrejection', function(event) {
+          const reason = event.reason;
+          const msg = String(reason?.message || reason || '');
+          if (msg.includes('WebSocket') || msg.includes('vite') || msg.includes('closed without opened')) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+
+        window.addEventListener('error', function(event) {
+          const msg = String(event.message || '');
+          if (msg.includes('WebSocket') || msg.includes('vite') || msg.includes('closed without opened')) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+
+        const _error = console.error;
+        console.error = function(...args) {
+          for (let i = 0; i < args.length; i++) {
+            const msg = String(args[i]?.message || args[i] || '');
+            if (msg.includes('WebSocket') || msg.includes('vite') || msg.includes('closed without opened')) {
+              return;
+            }
+          }
+          _error.apply(console, args);
+        };
+      })();
+    </script>
+    <title>ArtisanPro Afrique</title>
+    <meta name="description" content="Plateforme professionnelle des artisans d'Afrique - Trouvez un artisan près de vous" />
+    <meta property="og:title" content="ArtisanPro Afrique" />
+    <meta property="og:description" content="Plateforme professionnelle des artisans d'Afrique - Trouvez un artisan près de vous" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#FF6B00" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cabinet+Grotesk:wght@700;800;900&display=swap" rel="stylesheet">
+    <script>
+      // Nettoyage ciblé uniquement des anciens scripts dev-sw.js temporaires sans toucher au Service Worker PWA officiel
+      (function() {
+        try {
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.getRegistrations().then(function(registrations) {
+              for (var i = 0; i < registrations.length; i++) {
+                var reg = registrations[i];
+                var scriptUrl = (reg.active || reg.waiting || reg.installing)?.scriptURL || '';
+                if (scriptUrl.includes('dev-sw.js')) {
+                  reg.unregister().catch(function() {});
+                }
+              }
+            }).catch(function() {});
+          }
+        } catch(e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-CY92WTaR.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CXMDtgGp.css">
+  <script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
+  <body class="bg-[#F5F5F5] text-neutral-900 antialiased selection:bg-[#FF6B00] selection:text-white">
+    <div id="root"></div>
+  </body>
+</html>
+

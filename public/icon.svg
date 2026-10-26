@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF6B00"/>
+      <stop offset="100%" stop-color="#FF8C38"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="16" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  
+  <!-- Base background (safe for any and maskable) -->
+  <rect width="512" height="512" rx="112" fill="url(#brandGrad)"/>
+
+  <!-- Subtle glow / inner badge circle within safe zone -->
+  <circle cx="256" cy="256" r="176" fill="#FFFFFF" fill-opacity="0.12"/>
+
+  <!-- Hammer / Artisan Icon inside safe zone -->
+  <g transform="translate(144, 136) scale(1.0)" filter="url(#shadow)">
+    <!-- Hammer head -->
+    <path d="M168 40 L196 12 C204 4 216 4 224 12 L244 32 C252 40 252 52 244 60 L216 88 L168 40 Z" fill="#FFFFFF"/>
+    <path d="M120 72 L168 24 L200 56 L152 104 Z" fill="#F5F5F5"/>
+    <path d="M100 92 L128 64 L160 96 L132 124 Z" fill="#E5E5E5"/>
+    <!-- Hammer claw/back -->
+    <path d="M176 16 C190 2 214 2 228 16 L238 26 C220 22 200 30 188 42 L168 22 Z" fill="#FFFFFF"/>
+    <!-- Handle -->
+    <path d="M136 120 L24 232 C16 240 16 252 24 260 L36 272 C44 280 56 280 64 272 L176 160 L136 120 Z" fill="#FFFFFF"/>
+    <!-- Handle grip texture -->
+    <path d="M48 248 L64 232" stroke="#FF6B00" stroke-width="6" stroke-linecap="round"/>
+    <path d="M64 264 L80 248" stroke="#FF6B00" stroke-width="6" stroke-linecap="round"/>
+    <!-- Sparkles -->
+    <path d="M50 40 L55 52 L67 57 L55 62 L50 74 L45 62 L33 57 L45 52 Z" fill="#FFFFFF" fill-opacity="0.9"/>
+    <path d="M210 180 L214 188 L222 192 L214 196 L210 204 L206 196 L198 192 L206 188 Z" fill="#FFFFFF" fill-opacity="0.9"/>
+  </g>
+</svg>

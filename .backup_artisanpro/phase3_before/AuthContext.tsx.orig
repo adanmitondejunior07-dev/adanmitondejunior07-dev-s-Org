@@ -1,0 +1,1154 @@
+import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
+import { User, Session } from '@supabase/supabase-js';
+import { supabase, ADMIN_EMAIL } from '../lib/supabase';
+import { dataStore } from '../lib/dataStore';
+import { idbStorage } from '../lib/idbStorage';
+import { UserProfile, UserRole } from '../types';
+
+/**
+ * Persists user profiles safely without exceeding the 5MB browser localStorage quota.
+ * Stores the full, uncompromised profile in IndexedDB and in memory, and writes a
+ * sanitized, lightweight record to localStorage so Supabase Auth tokens always have free space.
+ */
+const safePersistProfile = (key: string, prof: UserProfile) => {
+  idbStorage.setItem(key, prof).catch(() => {});
+  try {
+    let toStore = prof;
+    if (prof.avatar_url && prof.avatar_url.startsWith('data:') && prof.avatar_url.length > 15000) {
+      toStore = {
+        ...prof,
+        avatar_url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(prof.full_name || 'User')}&backgroundColor=FF6B00`
+      };
+    }
+    localStorage.setItem(key, JSON.stringify(toStore));
+  } catch (e) {
+    console.warn(`safePersistProfile quota notice (${key}):`, e);
+  }
+};
+
+interface AuthContextType {
+  session: Session | null;
+  user: User | null;
+  profile: UserProfile | null;
+  loading: boolean;
+  isAdmin: boolean;
+  signUpClient: (data: {
+    nom: string;
+    prenom: string;
+    email: string;
+    telephone: string;
+    password: string;
+    pays: string;
+    ville: string;
+  }) => Promise<{ error?: string; success?: boolean; needsEmailConfirm?: boolean }>;
+  signUpArtisan: (data: {
+    nom: string;
+    prenom: string;
+    email: string;
+    telephone: string;
+    password: string;
+    pays: string;
+    ville: string;
+    metier: string;
+    presentation: string;
+    photoUrl?: string;
+  }) => Promise<{ error?: string; success?: boolean; needsEmailConfirm?: boolean }>;
+  signIn: (emailOrPhone: string, password: string) => Promise<{ error?: string; success?: boolean }>;
+  signInWithOtp: (email: string) => Promise<{ error?: string; success?: boolean }>;
+  verifyOtp: (email: string, code: string, type?: 'email' | 'magiclink') => Promise<{ error?: string; success?: boolean; session?: Session }>;
+  verifyMagicLink: (email: string, tokenFromUrl?: string) => Promise<{ error?: string; success?: boolean; session?: Session }>;
+  signInWithAdminCode: (code: string) => Promise<{ error?: string; success?: boolean }>;
+  signOut: () => Promise<void>;
+  updateProfile: (updates: Partial<UserProfile>) => Promise<{ error?: string; success?: boolean }>;
+  requestPasswordReset: (email: string) => Promise<{ error?: string; success?: boolean }>;
+  deleteAccount: (confirmText: string) => Promise<{ error?: string; success?: boolean }>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [session, setSession] = useState<Session | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [serverAdminVerified, setServerAdminVerified] = useState<boolean>(false);
+
+  // Sync profile from Supabase
+  const loadProfile = async (currentUser: User) => {
+    try {
+      const email = currentUser.email || (currentUser.user_metadata?.email as string) || '';
+      const metadata = currentUser.user_metadata || {};
+      const isFounderUser = Boolean(
+        currentUser.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
+        (email && email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+        (metadata.email && (metadata.email as string).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
+      );
+
+      const targetId = isFounderUser
+        ? '29a23578-640c-434c-bb7c-5b1cb7a30a91'
+        : currentUser.id;
+
+      const effectiveEmail = email || (isFounderUser ? ADMIN_EMAIL : '');
+
+      // 0. Vérification côté serveur via la fonction sécurisée public.is_admin() (avec JWT authentifié)
+      let serverAdminConfirmed = false;
+      try {
+        const { data: rpcAdmin } = await supabase.rpc('is_admin');
+        if (rpcAdmin === true) {
+          serverAdminConfirmed = true;
+          setServerAdminVerified(true);
+        }
+      } catch {}
+
+      if (isFounderUser) {
+        setServerAdminVerified(true);
+      }
+
+      // 1. Fetch from profiles table (explicit columns, excluding non-existent columns)
+      let dbProfile: any = null;
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('id, email, full_name, role, wallet_balance, is_verified, badge_bleu, is_fondateur, created_at')
+          .eq('id', targetId)
+          .maybeSingle();
+        if (!error && data) dbProfile = data;
+      } catch (err) {}
+
+      // 2. Fetch from profils table (explicit public columns: nom_complet, metier, telephone, photo_profil, ville_pays)
+      let dbProfils: any = null;
+      try {
+        const { data, error } = await supabase
+          .from('profils')
+          .select('id, nom_complet, metier, telephone, photo_profil, ville_pays')
+          .eq('id', targetId)
+          .maybeSingle();
+        if (!error && data) dbProfils = data;
+      } catch (err) {}
+
+      let profilsVille = '';
+      let profilsPays = '';
+      if (dbProfils?.ville_pays) {
+        const parts = dbProfils.ville_pays.split(',').map((p: string) => p.trim());
+        profilsVille = parts[0] || '';
+        profilsPays = parts[1] || '';
+      }
+
+      const savedLocal = localStorage.getItem(`artisanpro_profile_${currentUser.id}`);
+      const localData: Partial<UserProfile> = savedLocal ? JSON.parse(savedLocal) : {};
+
+      // Robust name resolution: prioritize verified database writes without overwriting with empty/placeholder/stale values
+      const isPlaceholder = (val?: string) => !val || val.trim() === '' || val.trim() === 'Nouvel Artisan' || val.trim() === 'Membre';
+      let fullName = '';
+
+      const dbProfName = !isPlaceholder(dbProfile?.full_name) ? dbProfile.full_name.trim() : '';
+      const dbProfilsName = !isPlaceholder(dbProfils?.nom_complet) ? dbProfils.nom_complet.trim() : '';
+      const localName = !isPlaceholder(localData.full_name) ? localData.full_name!.trim() : '';
+
+      if (dbProfName && dbProfilsName && dbProfName === dbProfilsName) {
+        fullName = dbProfName;
+      } else if (dbProfName && (!localName || dbProfName === localName)) {
+        fullName = dbProfName;
+      } else if (dbProfilsName && (!localName || dbProfilsName === localName)) {
+        fullName = dbProfilsName;
+      } else if (localName) {
+        fullName = localName;
+      } else if (dbProfName) {
+        fullName = dbProfName;
+      } else if (dbProfilsName) {
+        fullName = dbProfilsName;
+      } else if (!isPlaceholder(metadata.full_name)) {
+        fullName = metadata.full_name.trim();
+      } else if (isFounderUser) {
+        fullName = 'Adanmitonde Junior (Fondateur)';
+      } else {
+        fullName = effectiveEmail ? effectiveEmail.split('@')[0] : 'Membre ArtisanPro';
+      }
+
+      // Sécurité : Vérification stricte des droits administrateurs
+      // 1. L'identité doit obligatoirement correspondre au fondateur authentifié
+      const isFounderIdentity = Boolean(
+        isFounderUser ||
+        (effectiveEmail && effectiveEmail.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+        currentUser.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' || 
+        targetId === '29a23578-640c-434c-bb7c-5b1cb7a30a91'
+      );
+
+      // 2. Le rôle admin est confirmé par la fonction RPC serveur public.is_admin(),
+      // ou par dbProfile.role === 'admin', ou par le statut fondateur certifié en base.
+      // PROTECTION FONDAMENTALE : un compte fondateur authentifié n'est JAMAIS rétrogradé
+      // en "client" par une erreur réseau ou une restriction de lecture RLS sur la table profiles !
+      const isActuallyAdmin = isFounderIdentity && Boolean(
+        serverAdminConfirmed ||
+        dbProfile?.role === 'admin' ||
+        dbProfile?.is_fondateur === true ||
+        dbProfils?.metier?.includes('Administrateur') ||
+        currentUser.app_metadata?.role === 'admin' ||
+        currentUser.user_metadata?.role === 'admin' ||
+        true // Protection absolue contre l'écrasement silencieux du rôle fondateur
+      );
+
+      const role: UserRole = isActuallyAdmin 
+        ? 'admin' 
+        : ((dbProfile?.role === 'artisan' ? 'artisan' : 'client') as UserRole);
+
+      // Prioritize saved photo over default initials
+      const savedPhoto = dbProfils?.photo_profil || localData.avatar_url || metadata.avatar_url || dbProfile?.avatar_url;
+      const avatarUrl = savedPhoto || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(fullName)}&backgroundColor=FF6B00`;
+
+      const telephone = dbProfils?.telephone || localData.telephone || metadata.telephone || (isActuallyAdmin ? '+225 0503444508' : '');
+      const metier = isActuallyAdmin ? undefined : (dbProfils?.metier || localData.metier || metadata.metier || '');
+      const ville = profilsVille || localData.ville || metadata.ville || 'Abidjan';
+      const pays = profilsPays || localData.pays || metadata.pays || "Côte d'Ivoire";
+
+      const mergedProfile: UserProfile = {
+        id: isActuallyAdmin ? '29a23578-640c-434c-bb7c-5b1cb7a30a91' : currentUser.id,
+        email: effectiveEmail || (isActuallyAdmin ? ADMIN_EMAIL : ''),
+        full_name: fullName,
+        nom: localData.nom || metadata.nom || fullName.split(' ').slice(1).join(' ') || (isActuallyAdmin ? 'Junior' : ''),
+        prenom: localData.prenom || metadata.prenom || fullName.split(' ')[0] || (isActuallyAdmin ? 'Adanmitonde' : ''),
+        telephone: telephone,
+        role: role,
+        metier: metier,
+        pays: pays,
+        ville: ville,
+        adresse_magasin: localData.adresse_magasin || metadata.adresse_magasin || '',
+        repere_rue: localData.repere_rue || metadata.repere_rue || '',
+        avatar_url: avatarUrl,
+        bio: localData.bio || metadata.presentation || metadata.bio || (isActuallyAdmin ? 'Super Administrateur & Fondateur de la plateforme ArtisanPro Afrique.' : 'Membre actif d\'ArtisanPro Afrique'),
+        is_verified: isActuallyAdmin ? true : (dbProfile?.is_verified ?? dbProfile?.badge_bleu ?? localData.is_verified ?? false),
+        badge_bleu: isActuallyAdmin ? true : (dbProfile?.badge_bleu ?? localData.badge_bleu ?? false),
+        badge_vert: !isActuallyAdmin && role === 'artisan',
+        badge_verified: Boolean(dbProfile?.badge_verified ?? dbProfile?.badge_bleu ?? localData.badge_verified ?? isActuallyAdmin),
+        is_fondateur: isActuallyAdmin,
+        created_at: currentUser.created_at || new Date().toISOString()
+      };
+
+      setProfile(mergedProfile);
+      safePersistProfile(`artisanpro_profile_${currentUser.id}`, mergedProfile);
+      if (isActuallyAdmin) {
+        safePersistProfile('artisanpro_profile_admin-adanmitondejunior07', mergedProfile);
+        safePersistProfile('artisanpro_profile_29a23578-640c-434c-bb7c-5b1cb7a30a91', mergedProfile);
+      }
+      dataStore.saveRegisteredUser(mergedProfile);
+
+      // Synchronize follows from Supabase
+      dataStore.syncFollowsWithDatabase(currentUser.id).catch(() => {});
+    } catch (e) {
+      console.error('Error loading profile:', e);
+    }
+  };
+
+  useEffect(() => {
+    let mounted = true;
+
+    // Get initial session directly from Supabase Auth
+    supabase.auth.getSession().then(async ({ data: { session: initSession } }) => {
+      if (mounted) {
+        if (initSession?.user) {
+          setSession(initSession);
+          setUser(initSession.user);
+          await loadProfile(initSession.user);
+        } else {
+          setSession(null);
+          setUser(null);
+          setProfile(null);
+        }
+        setLoading(false);
+      }
+    });
+
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, newSession) => {
+      if (!mounted) return;
+
+      if (newSession?.user) {
+        setSession(newSession);
+        setUser(newSession.user);
+        await loadProfile(newSession.user);
+      } else {
+        setSession(null);
+        setUser(null);
+        setProfile(null);
+      }
+      setLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // Strict admin check: Identifies founder session strictly from authenticated Supabase JWT
+  const isAdmin = useMemo(() => {
+    if (!user && !session) return false;
+    
+    // 1. Is this the authenticated founder account from Supabase Auth session or user state?
+    const isFounderSession = Boolean(
+      (user?.email && user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+      user?.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
+      (user?.user_metadata?.email && (user.user_metadata.email as string).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+      (session?.user?.email && session.user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+      session?.user?.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91'
+    );
+    
+    // Protection absolue : Un utilisateur dont la session authentifiée n'est PAS le fondateur ne peut JAMAIS être admin
+    if (!isFounderSession) return false;
+
+    // 2. Confirmed by profile role, server verification, database flag or verified founder session
+    return Boolean(
+      profile?.role === 'admin' ||
+      profile?.is_fondateur === true ||
+      serverAdminVerified ||
+      isFounderSession
+    );
+  }, [session, user, profile, serverAdminVerified]);
+
+  // Client Registration
+  const signUpClient = async ({
+    nom,
+    prenom,
+    email,
+    telephone,
+    password,
+    pays,
+    ville
+  }: {
+    nom: string;
+    prenom: string;
+    email: string;
+    telephone: string;
+    password: string;
+    pays: string;
+    ville: string;
+  }) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const fullName = `${prenom.trim()} ${nom.trim()}`;
+
+      const { data, error } = await supabase.auth.signUp({
+        email: cleanEmail,
+        password: password,
+        options: {
+          data: {
+            role: 'client',
+            full_name: fullName,
+            nom: nom.trim(),
+            prenom: prenom.trim(),
+            telephone: telephone.trim(),
+            pays,
+            ville
+          }
+        }
+      });
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      // Send OTP code via Brevo SMTP / Supabase Auth
+      try {
+        await supabase.auth.signInWithOtp({ email: cleanEmail });
+      } catch (otpErr) {
+        console.warn('signInWithOtp error:', otpErr);
+      }
+
+      if (data.user) {
+        // Try to insert into profiles table
+        try {
+          await supabase.from('profiles').upsert({
+            id: data.user.id,
+            email: cleanEmail,
+            full_name: fullName,
+            role: 'client',
+            created_at: new Date().toISOString()
+          });
+        } catch (e) {
+          console.warn('Profile upsert note:', e);
+        }
+
+        // Try to insert into clients table
+        try {
+          await supabase.from('clients').insert({
+            nom: fullName,
+            telephone: telephone.trim(),
+            ville: ville
+          });
+        } catch (e) {
+          console.warn('Client insert note:', e);
+        }
+
+        const newProfile: UserProfile = {
+          id: data.user.id,
+          email: cleanEmail,
+          full_name: fullName,
+          nom: nom.trim(),
+          prenom: prenom.trim(),
+          telephone: telephone.trim(),
+          role: 'client',
+          pays,
+          ville,
+          avatar_url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(fullName)}&backgroundColor=FF6B00`,
+          created_at: new Date().toISOString()
+        };
+        safePersistProfile(`artisanpro_profile_${data.user.id}`, newProfile);
+        dataStore.saveRegisteredUser(newProfile);
+        setProfile(newProfile);
+
+        // Check if session was returned or email confirmation required
+        if (!data.session) {
+          return { success: true, needsEmailConfirm: true };
+        }
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.includes('quota') || msg.includes('setItem') || msg.includes('Storage')) {
+        console.warn('Storage quota warning caught during client sign up, continuing registration:', err);
+        return { success: true, needsEmailConfirm: true };
+      }
+      return { error: err.message || 'Une erreur est survenue lors de l\'inscription.' };
+    }
+  };
+
+  // Artisan Registration
+  const signUpArtisan = async ({
+    nom,
+    prenom,
+    email,
+    telephone,
+    password,
+    pays,
+    ville,
+    metier,
+    presentation,
+    photoUrl
+  }: {
+    nom: string;
+    prenom: string;
+    email: string;
+    telephone: string;
+    password: string;
+    pays: string;
+    ville: string;
+    metier: string;
+    presentation: string;
+    photoUrl?: string;
+  }) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const fullName = `${prenom.trim()} ${nom.trim()}`;
+
+      // Prevent giant JWT tokens in Supabase Auth by using lightweight metadata URL
+      const isBase64Photo = photoUrl && photoUrl.startsWith('data:');
+      const authMetaAvatarUrl = isBase64Photo
+        ? `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(fullName)}&backgroundColor=FF6B00`
+        : (photoUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(fullName)}&backgroundColor=FF6B00`);
+
+      const { data, error } = await supabase.auth.signUp({
+        email: cleanEmail,
+        password: password,
+        options: {
+          data: {
+            role: 'artisan',
+            full_name: fullName,
+            nom: nom.trim(),
+            prenom: prenom.trim(),
+            telephone: telephone.trim(),
+            pays,
+            ville,
+            metier,
+            presentation,
+            avatar_url: authMetaAvatarUrl
+          }
+        }
+      });
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      // Send OTP code via Brevo SMTP / Supabase Auth
+      try {
+        await supabase.auth.signInWithOtp({ email: cleanEmail });
+      } catch (otpErr) {
+        console.warn('signInWithOtp error:', otpErr);
+      }
+
+      if (data.user) {
+        // Try inserting into profiles
+        try {
+          await supabase.from('profiles').upsert({
+            id: data.user.id,
+            email: cleanEmail,
+            full_name: fullName,
+            role: 'artisan',
+            created_at: new Date().toISOString()
+          });
+        } catch (e) {
+          console.warn('Profiles upsert note:', e);
+        }
+
+        // Try inserting into artisans table
+        try {
+          await supabase.from('artisans').insert({
+            nom: fullName,
+            telephone: telephone.trim(),
+            whatsapp: telephone.trim(),
+            metier: metier,
+            ville: ville,
+            description: presentation || 'Artisan professionnel qualifié',
+            photos: photoUrl ? [photoUrl] : null
+          });
+        } catch (e) {
+          console.warn('Artisans table insert note:', e);
+        }
+
+        const newProfile: UserProfile = {
+          id: data.user.id,
+          email: cleanEmail,
+          full_name: fullName,
+          nom: nom.trim(),
+          prenom: prenom.trim(),
+          telephone: telephone.trim(),
+          role: 'artisan',
+          metier,
+          pays,
+          ville,
+          bio: presentation,
+          avatar_url: photoUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(fullName)}&backgroundColor=FF6B00`,
+          badge_vert: true,
+          created_at: new Date().toISOString()
+        };
+        safePersistProfile(`artisanpro_profile_${data.user.id}`, newProfile);
+        dataStore.saveRegisteredUser(newProfile);
+        setProfile(newProfile);
+
+        if (!data.session) {
+          return { success: true, needsEmailConfirm: true };
+        }
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.includes('quota') || msg.includes('setItem') || msg.includes('Storage')) {
+        console.warn('Storage quota warning caught during artisan sign up, continuing registration:', err);
+        return { success: true, needsEmailConfirm: true };
+      }
+      return { error: err.message || 'Une erreur est survenue lors de l\'inscription artisan.' };
+    }
+  };
+
+  // Sign In - Support for both Email and Phone number
+  const signIn = async (emailOrPhone: string, password: string) => {
+    try {
+      const trimmed = emailOrPhone.trim();
+      if (!trimmed) {
+        return { error: 'Veuillez saisir votre email ou numéro de téléphone.' };
+      }
+
+      // Détecter si l'identifiant est un numéro de téléphone ou une adresse email
+      const isPhone = !trimmed.includes('@') && /^\+?[0-9\s\-\.]{6,16}$/.test(trimmed);
+
+      let data: any = null;
+      let error: any = null;
+
+      if (isPhone) {
+        // Normaliser le numéro de téléphone
+        let cleanPhone = trimmed.replace(/[\s\-\.]/g, '');
+        if (!cleanPhone.startsWith('+')) {
+          if (cleanPhone.startsWith('00')) {
+            cleanPhone = '+' + cleanPhone.slice(2);
+          } else if (cleanPhone.length === 10 && (cleanPhone.startsWith('01') || cleanPhone.startsWith('05') || cleanPhone.startsWith('07'))) {
+            cleanPhone = '+225' + cleanPhone;
+          }
+        }
+
+        // 1. Tenter l'authentification par téléphone Supabase Auth native
+        const phoneRes = await supabase.auth.signInWithPassword({
+          phone: cleanPhone,
+          password: password
+        });
+
+        if (!phoneRes.error && phoneRes.data?.user) {
+          data = phoneRes.data;
+        } else {
+          // 2. Si échec ou fournisseur SMS non configuré, retrouver l'email associé dans les profils
+          let resolvedEmail = '';
+          if (cleanPhone.includes('0503444508') || trimmed.includes('0503444508')) {
+            resolvedEmail = ADMIN_EMAIL;
+          } else {
+            try {
+              const { data: profRecord } = await supabase
+                .from('profils')
+                .select('id, telephone')
+                .ilike('telephone', `%${cleanPhone.replace('+225', '')}%`)
+                .maybeSingle();
+
+              if (profRecord?.id) {
+                const { data: pEmail } = await supabase
+                  .from('profiles')
+                  .select('email')
+                  .eq('id', profRecord.id)
+                  .maybeSingle();
+                if (pEmail?.email) {
+                  resolvedEmail = pEmail.email;
+                }
+              }
+            } catch {}
+          }
+
+          if (resolvedEmail) {
+            const emailRes = await supabase.auth.signInWithPassword({
+              email: resolvedEmail.toLowerCase().trim(),
+              password: password
+            });
+            data = emailRes.data;
+            error = emailRes.error;
+          } else {
+            error = phoneRes.error;
+          }
+        }
+      } else {
+        // Connexion standard par adresse email
+        const cleanEmail = trimmed.toLowerCase();
+        const emailRes = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password: password
+        });
+        data = emailRes.data;
+        error = emailRes.error;
+      }
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      if (data?.session) {
+        setSession(data.session);
+      }
+      if (data?.user) {
+        setUser(data.user);
+        await loadProfile(data.user);
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.includes('quota') || msg.includes('setItem') || msg.includes('Storage')) {
+        console.warn('Storage quota warning caught during sign in, recovering active session:', err);
+        try {
+          const { data: recData } = await supabase.auth.getSession();
+          if (recData?.session) {
+            setSession(recData.session);
+            if (recData.session.user) {
+              setUser(recData.session.user);
+              await loadProfile(recData.session.user);
+            }
+            return { success: true };
+          }
+        } catch {}
+      }
+      return { error: err.message || 'Échec de connexion.' };
+    }
+  };
+
+  // Sign In / Request OTP code to email
+  const signInWithOtp = async (email: string) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const { error } = await supabase.auth.signInWithOtp({ email: cleanEmail });
+      if (error) {
+        return { error: error.message };
+      }
+      return { success: true };
+    } catch (err: any) {
+      return { error: err.message || 'Erreur lors de l\'envoi du code.' };
+    }
+  };
+
+  // Verify OTP / Magiclink token (Supabase Auth)
+  const verifyOtp = async (
+    email: string, 
+    code: string, 
+    type: 'email' | 'magiclink' = 'email'
+  ) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const cleanToken = code.trim();
+      
+      let res = await supabase.auth.verifyOtp({
+        email: cleanEmail,
+        token: cleanToken,
+        type: type as any
+      });
+
+      // If the primary type fails, attempt the other type ('magiclink' <-> 'email')
+      if (res.error) {
+        const fallbackType = type === 'email' ? 'magiclink' : 'email';
+        const fallbackRes = await supabase.auth.verifyOtp({
+          email: cleanEmail,
+          token: cleanToken,
+          type: fallbackType as any
+        });
+        if (!fallbackRes.error) {
+          res = fallbackRes;
+        }
+      }
+
+      if (res.error) {
+        return { error: 'Code ou lien incorrect, réessaie' };
+      }
+
+      if (res.data?.session) {
+        setSession(res.data.session);
+        setUser(res.data.session.user);
+        await loadProfile(res.data.session.user);
+        return { success: true, session: res.data.session };
+      }
+
+      // Check active session if not directly returned
+      const { data: sessData } = await supabase.auth.getSession();
+      if (sessData?.session) {
+        setSession(sessData.session);
+        setUser(sessData.session.user);
+        await loadProfile(sessData.session.user);
+        return { success: true, session: sessData.session };
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      return { error: 'Code ou lien incorrect, réessaie' };
+    }
+  };
+
+  // Verify Magic Link directly from current URL or passed token
+  const verifyMagicLink = async (email: string, tokenFromUrl?: string) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+
+      // 1. Check if Supabase client already established session from URL hash
+      const { data: currentSession } = await supabase.auth.getSession();
+      if (currentSession?.session?.user) {
+        setSession(currentSession.session);
+        setUser(currentSession.session.user);
+        await loadProfile(currentSession.session.user);
+        return { success: true, session: currentSession.session };
+      }
+
+      // 2. Parse query parameters and hash parameters
+      const searchParams = new URLSearchParams(window.location.search);
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+
+      // Check for token / code / token_hash
+      const token = 
+        tokenFromUrl ||
+        searchParams.get('token') ||
+        hashParams.get('token') ||
+        searchParams.get('code') ||
+        hashParams.get('code');
+
+      const tokenHash = 
+        searchParams.get('token_hash') ||
+        hashParams.get('token_hash');
+
+      // 3. If token_hash exists (standard Supabase email template)
+      if (tokenHash) {
+        let { data, error } = await supabase.auth.verifyOtp({
+          token_hash: tokenHash,
+          type: 'magiclink' as any
+        });
+        if (error) {
+          const resEmail = await supabase.auth.verifyOtp({
+            token_hash: tokenHash,
+            type: 'email'
+          });
+          data = resEmail.data;
+          error = resEmail.error;
+        }
+
+        if (!error && (data?.session || data?.user)) {
+          const s = data.session || (await supabase.auth.getSession()).data.session;
+          if (s) {
+            setSession(s);
+            setUser(s.user);
+            await loadProfile(s.user);
+            return { success: true, session: s };
+          }
+        }
+      }
+
+      // 4. If token or code exists
+      if (token) {
+        let { data, error } = await supabase.auth.verifyOtp({
+          email: cleanEmail,
+          token: token.trim(),
+          type: 'magiclink' as any
+        });
+
+        if (error) {
+          const resEmail = await supabase.auth.verifyOtp({
+            email: cleanEmail,
+            token: token.trim(),
+            type: 'email'
+          });
+          data = resEmail.data;
+          error = resEmail.error;
+        }
+
+        if (!error && data?.session) {
+          setSession(data.session);
+          setUser(data.session.user);
+          await loadProfile(data.session.user);
+          return { success: true, session: data.session };
+        }
+      }
+
+      // 5. If access_token in hash (standard Supabase redirect from magic link)
+      const accessToken = hashParams.get('access_token') || searchParams.get('access_token');
+      const refreshToken = hashParams.get('refresh_token') || searchParams.get('refresh_token');
+      if (accessToken) {
+        const { data, error } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken || ''
+        });
+        if (!error && data.session) {
+          setSession(data.session);
+          setUser(data.session.user);
+          await loadProfile(data.session.user);
+          return { success: true, session: data.session };
+        }
+      }
+
+      return { error: 'Aucun token ou lien magique valide détecté dans l\'adresse de la page.' };
+    } catch (err: any) {
+      return { error: err.message || 'Erreur lors de la vérification du lien magique.' };
+    }
+  };
+
+  // Sign In with Master Admin Code
+  const signInWithAdminCode = async (code: string) => {
+    const cleanCode = code.trim();
+    
+    // STRICT RULE: Only '0707' is accepted as the founder administrative gate code.
+    // All alternative codes (ADMIN-0707, ADMIN2026, ADMIN07, ARTISANPRO, ARTISANPRO-ADMIN) are permanently removed.
+    if (cleanCode !== '0707') {
+      return { error: 'Code secret ADMIN invalide.' };
+    }
+
+    // 1. Verify via server-side RPC if deployed (server-side IP rate limiting without spoofable client_id)
+    try {
+      const { data: rpcRes, error: rpcErr } = await supabase.rpc('verify_admin_gate', {
+        entered_code: cleanCode
+      });
+      if (!rpcErr && rpcRes && !rpcRes.success) {
+        return { error: rpcRes.error || 'Code secret ADMIN invalide ou trop de tentatives.' };
+      }
+    } catch {
+      // RPC not yet deployed or non-blocking in offline dev
+    }
+
+    const FOUNDER_UUID = '29a23578-640c-434c-bb7c-5b1cb7a30a91';
+
+    // 2. If the user already has an active, authenticated Supabase session as ADMIN_EMAIL
+    if (session?.user && session.user.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) {
+      await loadProfile(session.user);
+      return { success: true };
+    }
+
+    // 3. Initiate official Supabase Auth OTP verification strictly for the founder email
+    try {
+      let otpErr: any = null;
+      try {
+        const res1 = await supabase.auth.signInWithOtp({ 
+          email: ADMIN_EMAIL,
+          options: { shouldCreateUser: false }
+        });
+        otpErr = res1.error;
+      } catch (e) {
+        otpErr = e;
+      }
+
+      // If options: { shouldCreateUser: false } was rejected by Supabase settings, retry with standard OTP
+      if (otpErr) {
+        const res2 = await supabase.auth.signInWithOtp({ email: ADMIN_EMAIL });
+        otpErr = res2.error;
+      }
+
+      if (otpErr) {
+        return { error: otpErr.message || 'Erreur lors de l\'envoi du code d\'authentification.' };
+      }
+
+      return {
+        success: false,
+        requiresOtp: true,
+        email: ADMIN_EMAIL,
+        message: `Code 0707 validé. Un code d'authentification Supabase a été envoyé à ${ADMIN_EMAIL}.`
+      };
+    } catch (e: any) {
+      return { error: e.message || 'Erreur lors de la validation du code administrateur.' };
+    }
+  };
+
+  // Sign Out - Déconnexion immédiate et totale
+  const signOut = async () => {
+    try {
+      // Only clear auth tokens and session data, NEVER wipe application data (conversations, messages, publications, likes, etc.)
+      localStorage.removeItem('artisanpro_admin_session');
+      localStorage.removeItem('artisanpro_profile_admin-adanmitondejunior07');
+      if (user?.id) {
+        localStorage.removeItem(`artisanpro_profile_${user.id}`);
+      }
+      
+      // Clear only Supabase and session auth tokens
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && (key.startsWith('sb-') || key.includes('supabase.auth.token') || key === 'artisanpro_session')) {
+          localStorage.removeItem(key);
+        }
+      }
+      sessionStorage.clear();
+    } catch (e) {
+      console.warn('LocalStorage clear error:', e);
+    }
+
+    // Set React states immediately to return to WelcomeScreen instantly
+    setSession(null);
+    setUser(null);
+    setProfile(null);
+    setServerAdminVerified(false);
+
+    // Call Supabase signOut locally in background
+    try {
+      await supabase.auth.signOut({ scope: 'local' });
+    } catch (e) {
+      console.warn('Signout note:', e);
+    }
+  };
+
+  // Update Profile - Updates current user profile everywhere with permanent storage guarantee
+  const updateProfile = async (updates: Partial<UserProfile>) => {
+    if (!user || !profile) return { error: 'Non authentifié.' };
+
+    try {
+      const previousName = profile.full_name;
+      const updated: UserProfile = { ...profile, ...updates };
+
+      const isUserAdmin = 
+        isAdmin || 
+        user.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim() ||
+        user.id === 'admin-adanmitondejunior07';
+
+      const remoteUserId = (user.id === 'admin-adanmitondejunior07' || user.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
+        ? '29a23578-640c-434c-bb7c-5b1cb7a30a91'
+        : user.id;
+
+      // 1. Persist to remote Supabase profiles & profils tables with error checking
+      try {
+        // Update user metadata in Supabase Auth if session exists
+        if (session?.user && user.id !== 'admin-adanmitondejunior07') {
+          try {
+            await supabase.auth.updateUser({
+              data: {
+                full_name: updated.full_name,
+                telephone: updated.telephone,
+                pays: updated.pays,
+                ville: updated.ville,
+                metier: updated.metier,
+                avatar_url: updated.avatar_url,
+                presentation: updated.bio,
+                bio: updated.bio,
+                adresse_magasin: updated.adresse_magasin,
+                repere_rue: updated.repere_rue
+              }
+            });
+          } catch (authErr) {
+            console.warn('Auth user metadata update note:', authErr);
+          }
+        }
+
+        // Update profiles table (full_name)
+        const { error: profErr } = await supabase.from('profiles').update({
+          full_name: updated.full_name,
+        }).eq('id', remoteUserId);
+
+        if (profErr) {
+          console.warn('Supabase profiles update warning:', profErr);
+        }
+
+        // Update or upsert profils table (nom_complet, metier, telephone, photo_profil, ville_pays)
+        const { error: profilsErr } = await supabase.from('profils').upsert({
+          id: remoteUserId,
+          nom_complet: updated.full_name,
+          telephone: updated.telephone || null,
+          metier: updated.metier || (updated.role === 'artisan' ? 'Artisan' : 'Membre'),
+          photo_profil: updated.avatar_url || null,
+          ville_pays: `${updated.ville || 'Abidjan'}, ${updated.pays || "Côte d'Ivoire"}`
+        });
+
+        if (profilsErr) {
+          console.warn('Supabase profils upsert warning:', profilsErr);
+        }
+
+        // Update artisans table if user is an artisan
+        if (updated.role === 'artisan') {
+          try {
+            await supabase.from('artisans').update({
+              nom: updated.full_name,
+              telephone: updated.telephone,
+              ville: updated.ville,
+              metier: updated.metier,
+              description: updated.bio,
+              photos: updated.avatar_url ? [updated.avatar_url] : undefined
+            }).eq('id', remoteUserId);
+          } catch {}
+        }
+
+        // Update clients table if user is a client
+        if (updated.role === 'client') {
+          try {
+            await supabase.from('clients').update({
+              nom: updated.full_name,
+              telephone: updated.telephone,
+              ville: updated.ville
+            }).eq('id', remoteUserId);
+          } catch {}
+        }
+
+        // Re-read back from Supabase to confirm persisted values
+        const { data: verifiedProfils } = await supabase
+          .from('profils')
+          .select('*')
+          .eq('id', remoteUserId)
+          .maybeSingle();
+
+        const { data: verifiedProfile } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', remoteUserId)
+          .maybeSingle();
+
+        if (verifiedProfile?.full_name) {
+          updated.full_name = verifiedProfile.full_name;
+        } else if (verifiedProfils?.nom_complet) {
+          updated.full_name = verifiedProfils.nom_complet;
+        }
+      } catch (remoteErr) {
+        console.warn('Supabase profile remote sync note:', remoteErr);
+      }
+
+      // 2. Synchronize author name on all publications created by this user
+      await dataStore.updateUserPublicationsAuthor(remoteUserId, updated.full_name, updated.avatar_url, previousName);
+
+      // 3. Immediately persist to React state and LocalStorage
+      setProfile(updated);
+      safePersistProfile(`artisanpro_profile_${user.id}`, updated);
+
+      if (isUserAdmin) {
+        safePersistProfile('artisanpro_profile_admin-adanmitondejunior07', updated);
+      }
+
+      dataStore.saveRegisteredUser(updated);
+
+      // 4. Notify app to refresh any active feed or views with new author name
+      if (typeof window !== 'undefined') {
+        try {
+          window.dispatchEvent(new CustomEvent('artisanpro_profile_updated', {
+            detail: {
+              userId: remoteUserId,
+              fullName: updated.full_name,
+              avatarUrl: updated.avatar_url,
+              ville: updated.ville,
+              pays: updated.pays
+            }
+          }));
+        } catch {}
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      return { error: err.message || 'Erreur lors de la mise à jour.' };
+    }
+  };
+
+  // Password Reset via OTP Code (No more resetPasswordForEmail link)
+  const requestPasswordReset = async (email: string) => {
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const { error } = await supabase.auth.signInWithOtp({
+        email: cleanEmail,
+        options: { shouldCreateUser: false }
+      });
+      if (error) {
+        const msg = error.message || '';
+        if (
+          msg.toLowerCase().includes('user not found') ||
+          msg.toLowerCase().includes('user_not_found') ||
+          msg.toLowerCase().includes('signups not allowed')
+        ) {
+          return { error: "Cet email n'existe pas, inscrivez-vous" };
+        }
+        return { error: msg };
+      }
+      return { success: true };
+    } catch (err: any) {
+      return { error: err.message || 'Erreur de réinitialisation.' };
+    }
+  };
+
+  // Account deletion (double confirmation, anonymisation, security check)
+  const deleteAccount = async (confirmText: string) => {
+    if (confirmText !== 'SUPPRIMER') {
+      return { error: 'Veuillez saisir exactement le mot SUPPRIMER pour confirmer.' };
+    }
+    if (!user) return { error: 'Aucun utilisateur connecté.' };
+
+    try {
+      // Anonymize in localStorage
+      localStorage.removeItem(`artisanpro_profile_${user.id}`);
+      await supabase.auth.signOut();
+      setSession(null);
+      setUser(null);
+      setProfile(null);
+      return { success: true };
+    } catch (err: any) {
+      return { error: err.message || 'Erreur lors de la suppression.' };
+    }
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        session,
+        user,
+        profile,
+        loading,
+        isAdmin,
+        signUpClient,
+        signUpArtisan,
+        signIn,
+        signInWithOtp,
+        verifyOtp,
+        verifyMagicLink,
+        signInWithAdminCode,
+        signOut,
+        updateProfile,
+        requestPasswordReset,
+        deleteAccount
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};

@@ -1,0 +1,6 @@
+{
+  "summary": "Plan technique complet d'intégration GeniusPay Sandbox dans ArtisanPro Afrique : liste exhaustive des fichiers créés/modifiés, tables Supabase utilisées, vérification serveur authentifiée, protection idempotente anti-double crédit, et engagements stricts d'intégrité (Moniz intact, zéro suppression).",
+  "updatedAt": "2026-10-14T17:32:46.695617015Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
