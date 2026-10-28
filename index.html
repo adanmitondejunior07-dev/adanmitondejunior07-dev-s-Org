@@ -99,17 +99,20 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cabinet+Grotesk:wght@700;800;900&display=swap" rel="stylesheet">
     <script>
-      // Nettoyage ciblé uniquement des anciens scripts dev-sw.js temporaires sans toucher au Service Worker PWA officiel
+      // Désactiver et désinscrire tout Service Worker et vider tous les caches associés
       (function() {
         try {
           if ('serviceWorker' in navigator) {
             navigator.serviceWorker.getRegistrations().then(function(registrations) {
               for (var i = 0; i < registrations.length; i++) {
-                var reg = registrations[i];
-                var scriptUrl = (reg.active || reg.waiting || reg.installing)?.scriptURL || '';
-                if (scriptUrl.includes('dev-sw.js')) {
-                  reg.unregister().catch(function() {});
-                }
+                registrations[i].unregister().catch(function() {});
+              }
+            }).catch(function() {});
+          }
+          if ('caches' in window) {
+            caches.keys().then(function(names) {
+              for (var i = 0; i < names.length; i++) {
+                caches.delete(names[i]).catch(function() {});
               }
             }).catch(function() {});
           }

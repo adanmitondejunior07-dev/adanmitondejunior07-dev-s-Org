@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
 import { User, Session } from '@supabase/supabase-js';
-import { supabase, ADMIN_EMAIL } from '../lib/supabase';
+import { supabase, SUPABASE_URL, ADMIN_EMAIL, formatFetchError } from '../lib/supabase';
 import { dataStore } from '../lib/dataStore';
 import { idbStorage } from '../lib/idbStorage';
 import { UserProfile, UserRole } from '../types';
@@ -84,31 +84,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const email = currentUser.email || (currentUser.user_metadata?.email as string) || '';
       const metadata = currentUser.user_metadata || {};
-      const isFounderUser = Boolean(
-        currentUser.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
-        currentUser.id === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb' ||
-        (email && email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-        (metadata.email && (metadata.email as string).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
-      );
-
-      // Utiliser l'identifiant réel de la session Supabase Auth pour les lectures et écritures soumises à RLS
       const targetId = currentUser.id;
-
-      const effectiveEmail = email || (isFounderUser ? ADMIN_EMAIL : '');
-
-      // 0. Vérification côté serveur via la fonction sécurisée public.is_admin() (avec JWT authentifié)
-      let serverAdminConfirmed = false;
-      try {
-        const { data: rpcAdmin } = await supabase.rpc('is_admin');
-        if (rpcAdmin === true) {
-          serverAdminConfirmed = true;
-          setServerAdminVerified(true);
-        }
-      } catch {}
-
-      if (isFounderUser) {
-        setServerAdminVerified(true);
-      }
+      const effectiveEmail = email;
 
       // 1. Fetch from profiles table (explicit columns, excluding non-existent columns)
       let dbProfile: any = null;
@@ -181,45 +158,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         fullName = localName;
       } else if (dbProfName) {
         fullName = dbProfName;
-      } else if (isFounderUser) {
-        fullName = 'Adanmitonde Junior (Fondateur)';
+      } else if (email && email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) {
+        fullName = 'Adanmitonde Junior';
       } else {
         fullName = effectiveEmail ? effectiveEmail.split('@')[0] : 'Membre ArtisanPro';
       }
 
-      // Sécurité : Vérification stricte des droits administrateurs
-      // 1. L'identité doit obligatoirement correspondre au fondateur authentifié
-      const isFounderIdentity = Boolean(
-        isFounderUser ||
-        (effectiveEmail && effectiveEmail.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-        currentUser.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' || 
-        targetId === '29a23578-640c-434c-bb7c-5b1cb7a30a91'
-      );
+      // Règle stricte : Le rôle admin est lu depuis profiles.role
+      const isActuallyAdmin = dbProfile?.role === 'admin';
 
-      // 2. Le rôle admin est confirmé par la fonction RPC serveur public.is_admin(),
-      // ou par dbProfile.role === 'admin', ou par le statut fondateur certifié en base.
-      const isActuallyAdmin = isFounderIdentity && Boolean(
-        serverAdminConfirmed ||
-        dbProfile?.role === 'admin' ||
-        dbProfile?.is_fondateur === true ||
-        dbProfils?.metier?.includes('Administrateur') ||
-        currentUser.app_metadata?.role === 'admin' ||
-        currentUser.user_metadata?.role === 'admin' ||
-        true // Protection absolue contre l'écrasement silencieux du rôle fondateur
-      );
-
-      // Résolution du rôle : préserver fidèlement le rôle artisan ou admin
-      const isArtisanCandidate = Boolean(
-        metadata.role === 'artisan' || 
-        dbProfile?.role === 'artisan' || 
-        idbProfile?.role === 'artisan' ||
-        localData.role === 'artisan' || 
-        (dbProfils?.metier && !isPlaceholderMetier(dbProfils.metier))
-      );
-
-      const role: UserRole = isActuallyAdmin 
-        ? 'admin' 
-        : (isArtisanCandidate ? 'artisan' : 'client');
+      // Résolution du rôle : lu en priorité depuis profiles.role, ou metadata Auth
+      const role: UserRole = dbProfile?.role === 'admin'
+        ? 'admin'
+        : (dbProfile?.role === 'artisan' || metadata.role === 'artisan' || idbProfile?.role === 'artisan' || (dbProfils?.metier && !isPlaceholderMetier(dbProfils.metier))
+            ? 'artisan'
+            : (dbProfile?.role === 'client' || metadata.role === 'client' ? 'client' : (dbProfile?.role || 'client')));
 
       // Helper pour détecter les placeholders DiceBear
       const isDicebear = (u?: string) => !u || u.trim() === '' || u.includes('dicebear.com');
@@ -279,35 +232,44 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         (!isPlaceholderLocation(metadata.pays) ? metadata.pays : undefined) || 
         "Côte d'Ivoire";
 
+      const repereRue = metadata.repere_rue || metadata.rue || idbProfile?.repere_rue || localData.repere_rue || '';
+      const adresseMagasin = metadata.adresse_magasin || metadata.adresse || idbProfile?.adresse_magasin || localData.adresse_magasin || '';
+      const gpsLat = metadata.gps_lat !== undefined && metadata.gps_lat !== null
+        ? Number(metadata.gps_lat)
+        : (idbProfile?.gps_lat ?? localData.gps_lat);
+      const gpsLng = metadata.gps_lng !== undefined && metadata.gps_lng !== null
+        ? Number(metadata.gps_lng)
+        : (idbProfile?.gps_lng ?? localData.gps_lng);
+      const gpsLabel = metadata.gps_label || idbProfile?.gps_label || localData.gps_label || '';
+
       const mergedProfile: UserProfile = {
-        id: isActuallyAdmin ? '29a23578-640c-434c-bb7c-5b1cb7a30a91' : currentUser.id,
-        email: effectiveEmail || (isActuallyAdmin ? ADMIN_EMAIL : ''),
+        id: currentUser.id,
+        email: email || dbProfile?.email || effectiveEmail || '',
         full_name: fullName,
-        nom: idbProfile?.nom || localData.nom || metadata.nom || fullName.split(' ').slice(1).join(' ') || (isActuallyAdmin ? 'Junior' : ''),
-        prenom: idbProfile?.prenom || localData.prenom || metadata.prenom || fullName.split(' ')[0] || (isActuallyAdmin ? 'Adanmitonde' : ''),
+        nom: idbProfile?.nom || localData.nom || metadata.nom || fullName.split(' ').slice(1).join(' ') || '',
+        prenom: idbProfile?.prenom || localData.prenom || metadata.prenom || fullName.split(' ')[0] || '',
         telephone: telephone,
         role: role,
         metier: metier,
         pays: pays,
         ville: ville,
-        adresse_magasin: idbProfile?.adresse_magasin || localData.adresse_magasin || metadata.adresse_magasin || '',
-        repere_rue: idbProfile?.repere_rue || localData.repere_rue || metadata.repere_rue || '',
+        adresse_magasin: adresseMagasin,
+        repere_rue: repereRue,
+        gps_lat: gpsLat,
+        gps_lng: gpsLng,
+        gps_label: gpsLabel,
         avatar_url: avatarUrl,
-        bio: idbProfile?.bio || localData.bio || metadata.presentation || metadata.bio || (isActuallyAdmin ? 'Super Administrateur & Fondateur de la plateforme ArtisanPro Afrique.' : 'Membre actif d\'ArtisanPro Afrique'),
+        bio: idbProfile?.bio || localData.bio || metadata.presentation || metadata.bio || (isActuallyAdmin ? 'Super Administrateur de la plateforme ArtisanPro Afrique.' : 'Membre actif d\'ArtisanPro Afrique'),
         is_verified: isActuallyAdmin ? true : (dbProfile?.is_verified ?? dbProfile?.badge_bleu ?? idbProfile?.is_verified ?? localData.is_verified ?? false),
         badge_bleu: isActuallyAdmin ? true : (dbProfile?.badge_bleu ?? idbProfile?.badge_bleu ?? localData.badge_bleu ?? false),
         badge_vert: !isActuallyAdmin && role === 'artisan',
         badge_verified: Boolean(dbProfile?.badge_verified ?? dbProfile?.badge_bleu ?? idbProfile?.badge_verified ?? localData.badge_verified ?? isActuallyAdmin),
         is_fondateur: isActuallyAdmin,
-        created_at: currentUser.created_at || new Date().toISOString()
+        created_at: dbProfile?.created_at || currentUser.created_at || new Date().toISOString()
       };
 
       setProfile(mergedProfile);
       safePersistProfile(`artisanpro_profile_${currentUser.id}`, mergedProfile);
-      if (isActuallyAdmin) {
-        safePersistProfile('artisanpro_profile_admin-adanmitondejunior07', mergedProfile);
-        safePersistProfile('artisanpro_profile_29a23578-640c-434c-bb7c-5b1cb7a30a91', mergedProfile);
-      }
       dataStore.saveRegisteredUser(mergedProfile);
 
       // Synchronize follows from Supabase
@@ -334,31 +296,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setSession(initSession);
         setUser(initSession.user);
 
-        // 1. Accélération immédiate de l'affichage du profil depuis le cache local sécurisé
+        // 1. Accélération de l'affichage du profil depuis le cache local sécurisé
         try {
           const savedLocal = localStorage.getItem(`artisanpro_profile_${initSession.user.id}`);
           if (savedLocal) {
             const cached = JSON.parse(savedLocal);
             if (cached && typeof cached === 'object' && cached.full_name) {
-              // Règle de sécurité stricte : Le cache local ne peut accorder de droits administrateur qu'au compte fondateur certifié
-              const isFounderSession = Boolean(
-                initSession.user.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
-                initSession.user.id === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb' ||
-                (initSession.user.email && initSession.user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
-              );
-              const safeCached: UserProfile = {
-                ...cached,
-                role: isFounderSession
-                  ? 'admin'
-                  : (cached.role === 'admin' ? 'client' : cached.role),
-                is_fondateur: isFounderSession
-              };
-              setProfile(safeCached);
+              setProfile(cached);
             }
           }
         } catch {}
 
-        // Débloquer immédiatement l'écran « Chargement sécurisé... » (0 ms d'attente supplémentaire)
         localStorage.setItem('artisanpro_active_user_id', initSession.user.id);
         setLoading(false);
 
@@ -367,108 +315,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           console.warn('Background profile refresh note:', err);
         });
       } else {
-        // Restaurer la session administrateur fondateur si activement connectée
-        const savedAdminSession = localStorage.getItem('artisanpro_admin_session');
-        if (savedAdminSession === 'true') {
-          const founderUser: any = {
-            id: '29a23578-640c-434c-bb7c-5b1cb7a30a91',
-            email: ADMIN_EMAIL,
-            user_metadata: {
-              full_name: 'Adanmitonde Junior (Fondateur)',
-              nom: 'Junior',
-              prenom: 'Adanmitonde',
-              role: 'admin',
-              is_fondateur: true,
-              telephone: '+225 0503444508',
-              ville: 'Abidjan',
-              pays: "Côte d'Ivoire"
-            },
-            app_metadata: { role: 'admin' },
-            role: 'authenticated',
-            aud: 'authenticated',
-            created_at: '2026-01-01T00:00:00Z'
-          };
-          const founderSession: any = {
-            access_token: 'admin-authenticated-token',
-            token_type: 'bearer',
-            user: founderUser
-          };
-          const savedProfStr = localStorage.getItem('artisanpro_profile_29a23578-640c-434c-bb7c-5b1cb7a30a91') || 
-                               localStorage.getItem('artisanpro_profile_admin-adanmitondejunior07');
-          let fProf: UserProfile | null = null;
-          if (savedProfStr) {
-            try { fProf = JSON.parse(savedProfStr); } catch {}
-          }
-          if (!fProf || fProf.email?.toLowerCase().trim() !== ADMIN_EMAIL.toLowerCase().trim()) {
-            fProf = {
-              id: '29a23578-640c-434c-bb7c-5b1cb7a30a91',
-              email: ADMIN_EMAIL,
-              full_name: 'Adanmitonde Junior (Fondateur)',
-              nom: 'Junior',
-              prenom: 'Adanmitonde',
-              telephone: '+225 0503444508',
-              role: 'admin',
-              metier: 'Fondateur & Super Administrateur',
-              pays: "Côte d'Ivoire",
-              ville: 'Abidjan',
-              avatar_url: 'https://api.dicebear.com/7.x/initials/svg?seed=Adanmitonde%20Junior&backgroundColor=FF6B00',
-              bio: 'Super Administrateur & Fondateur de la plateforme ArtisanPro Afrique.',
-              is_verified: true,
-              badge_bleu: true,
-              badge_verified: true,
-              is_fondateur: true,
-              created_at: '2026-01-01T00:00:00Z'
-            };
-          }
-          setSession(founderSession);
-          setUser(founderUser);
-          setProfile(fProf);
-          setServerAdminVerified(true);
-          localStorage.setItem('artisanpro_active_user_id', founderUser.id);
-          setLoading(false);
-          return;
-        }
-
-        // Restaurer la session utilisateur actif si enregistrée
-        const activeUserId = localStorage.getItem('artisanpro_active_user_id');
-        if (activeUserId) {
-          const savedLocal = localStorage.getItem(`artisanpro_profile_${activeUserId}`);
-          if (savedLocal) {
-            try {
-              const uProf = JSON.parse(savedLocal);
-              if (uProf && uProf.id) {
-                const recoveredUser: any = {
-                  id: uProf.id,
-                  email: uProf.email || `${uProf.telephone || 'user'}@artisanpro.africa`,
-                  user_metadata: {
-                    full_name: uProf.full_name,
-                    nom: uProf.nom,
-                    prenom: uProf.prenom,
-                    role: uProf.role,
-                    telephone: uProf.telephone,
-                    ville: uProf.ville,
-                    pays: uProf.pays
-                  },
-                  app_metadata: { role: uProf.role },
-                  role: 'authenticated',
-                  aud: 'authenticated',
-                  created_at: uProf.created_at || new Date().toISOString()
-                };
-                const recoveredSession: any = {
-                  access_token: 'local-authenticated-token',
-                  token_type: 'bearer',
-                  user: recoveredUser
-                };
-                setSession(recoveredSession);
-                setUser(recoveredUser);
-                setProfile(uProf);
-                setLoading(false);
-                return;
-              }
-            } catch {}
-          }
-        }
-
         setSession(null);
         setUser(null);
         setProfile(null);
@@ -478,7 +324,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (mounted) setLoading(false);
     });
 
-    // Listen for auth changes
+    // Écouter les changements d'état d'authentification Supabase (persistance et rafraîchissement automatique du jeton)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, newSession) => {
       if (!mounted) return;
 
@@ -490,37 +336,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         loadProfile(newSession.user).catch((err) => {
           console.warn('Auth state change profile load note:', err);
         });
+      } else if (event === 'SIGNED_OUT') {
+        localStorage.removeItem('artisanpro_active_user_id');
+        setSession(null);
+        setUser(null);
+        setProfile(null);
+        setLoading(false);
       } else {
-        // PROTECTION ANTI-DÉCONNEXION INTEMPESTIVE
-        // 1. Ne JAMAIS déconnecter si une session administrateur fondateur est active
-        const savedAdminSession = localStorage.getItem('artisanpro_admin_session');
-        if (savedAdminSession === 'true') {
-          return;
-        }
-
-        // 2. Ne déconnecter QUE si l'événement est explicitement 'SIGNED_OUT'
-        // Ignorer les événements 'INITIAL_SESSION' vides ou micro-coupures réseau
-        if (event === 'SIGNED_OUT') {
-          localStorage.removeItem('artisanpro_active_user_id');
+        // En cas d'événement intermédiaire ou de coupure temporaire, vérifier avec getSession pour éviter une fausse déconnexion
+        const { data: { session: checkSession } } = await supabase.auth.getSession();
+        if (checkSession?.user) {
+          setSession(checkSession);
+          setUser(checkSession.user);
+          loadProfile(checkSession.user).catch(() => {});
+        } else {
           setSession(null);
           setUser(null);
           setProfile(null);
-          setLoading(false);
-        } else {
-          // Si un profil utilisateur actif existe dans le stockage persistant, ne pas déconnecter
-          const activeUserId = localStorage.getItem('artisanpro_active_user_id');
-          if (activeUserId) {
-            const savedLocal = localStorage.getItem(`artisanpro_profile_${activeUserId}`);
-            if (savedLocal) {
-              try {
-                const parsed = JSON.parse(savedLocal);
-                if (parsed && parsed.id) {
-                  return;
-                }
-              } catch {}
-            }
-          }
         }
+        setLoading(false);
       }
     });
 
@@ -531,30 +365,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
-  // Strict admin check: Identifies founder session strictly from authenticated Supabase JWT
+  // Le rôle admin est lu depuis profiles.role
   const isAdmin = useMemo(() => {
-    if (!user && !session) return false;
-    
-    // 1. Is this the authenticated founder account from Supabase Auth session or user state?
-    const isFounderSession = Boolean(
-      (user?.email && user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-      user?.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
-      (user?.user_metadata?.email && (user.user_metadata.email as string).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-      (session?.user?.email && session.user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-      session?.user?.id === '29a23578-640c-434c-bb7c-5b1cb7a30a91'
-    );
-    
-    // Protection absolue : Un utilisateur dont la session authentifiée n'est PAS le fondateur ne peut JAMAIS être admin
-    if (!isFounderSession) return false;
-
-    // 2. Confirmed by profile role, server verification, database flag or verified founder session
-    return Boolean(
-      profile?.role === 'admin' ||
-      profile?.is_fondateur === true ||
-      serverAdminVerified ||
-      isFounderSession
-    );
-  }, [session, user, profile, serverAdminVerified]);
+    return profile?.role === 'admin';
+  }, [profile]);
 
   // Client Registration
   const signUpClient = async ({
@@ -828,91 +642,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const cleanPass = password.trim();
       if (!trimmed) {
         return { error: 'Veuillez saisir votre email ou numéro de téléphone.' };
-      }
-
-      // Détecter si la tentative provient du Super Administrateur / Fondateur
-      const cleanLower = trimmed.toLowerCase();
-      const cleanDigitsOnly = trimmed.replace(/[^0-9]/g, '');
-      const isFounderAttempt = 
-        cleanLower === ADMIN_EMAIL.toLowerCase() ||
-        cleanLower === 'admin' ||
-        (cleanDigitsOnly.length >= 8 && '0503444508'.includes(cleanDigitsOnly.slice(-8)));
-
-      // Authentification directe de l'Administrateur Fondateur avec le code secret '0707'
-      if (isFounderAttempt && cleanPass === '0707') {
-        const founderUser: any = {
-          id: '29a23578-640c-434c-bb7c-5b1cb7a30a91',
-          email: ADMIN_EMAIL,
-          user_metadata: {
-            full_name: 'Adanmitonde Junior (Fondateur)',
-            nom: 'Junior',
-            prenom: 'Adanmitonde',
-            role: 'admin',
-            is_fondateur: true,
-            telephone: '+225 0503444508',
-            ville: 'Abidjan',
-            pays: "Côte d'Ivoire"
-          },
-          app_metadata: { role: 'admin' },
-          role: 'authenticated',
-          aud: 'authenticated',
-          created_at: '2026-01-01T00:00:00Z'
-        };
-
-        const founderSession: any = {
-          access_token: 'admin-authenticated-token',
-          token_type: 'bearer',
-          user: founderUser
-        };
-
-        // Si l'administrateur possède également son compte authentifié dans Supabase, synchroniser la session distante
-        try {
-          const { data: supaAuth } = await supabase.auth.signInWithPassword({
-            email: ADMIN_EMAIL,
-            password: password
-          });
-          if (supaAuth?.session) {
-            founderSession.access_token = supaAuth.session.access_token;
-            founderSession.refresh_token = supaAuth.session.refresh_token;
-            if (supaAuth.session.user) {
-              founderUser.id = supaAuth.session.user.id;
-            }
-          }
-        } catch {}
-
-        const founderProfile: UserProfile = {
-          id: '29a23578-640c-434c-bb7c-5b1cb7a30a91',
-          email: ADMIN_EMAIL,
-          full_name: 'Adanmitonde Junior (Fondateur)',
-          nom: 'Junior',
-          prenom: 'Adanmitonde',
-          telephone: '+225 0503444508',
-          role: 'admin',
-          metier: 'Fondateur & Super Administrateur',
-          pays: "Côte d'Ivoire",
-          ville: 'Abidjan',
-          avatar_url: 'https://api.dicebear.com/7.x/initials/svg?seed=Adanmitonde%20Junior&backgroundColor=FF6B00',
-          bio: 'Super Administrateur & Fondateur de la plateforme ArtisanPro Afrique.',
-          is_verified: true,
-          badge_bleu: true,
-          badge_verified: true,
-          is_fondateur: true,
-          created_at: '2026-01-01T00:00:00Z'
-        };
-
-        setSession(founderSession);
-        setUser(founderUser);
-        setProfile(founderProfile);
-        setServerAdminVerified(true);
-        localStorage.setItem('artisanpro_admin_session', 'true');
-        safePersistProfile(`artisanpro_profile_${founderUser.id}`, founderProfile);
-        safePersistProfile('artisanpro_profile_admin-adanmitondejunior07', founderProfile);
-        safePersistProfile('artisanpro_profile_29a23578-640c-434c-bb7c-5b1cb7a30a91', founderProfile);
-        dataStore.saveRegisteredUser(founderProfile);
-
-        loadProfile(founderUser).catch(() => {});
-
-        return { success: true };
       }
 
       // Détecter si l'identifiant est un numéro de téléphone ou une adresse email
@@ -1227,93 +956,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  // Sign In with Master Admin Code
-  const signInWithAdminCode = async (code: string) => {
-    const cleanCode = code.trim();
-    
-    // STRICT RULE: Only '0707' is accepted as the founder administrative gate code.
-    // All alternative codes (ADMIN-0707, ADMIN2026, ADMIN07, ARTISANPRO, ARTISANPRO-ADMIN) are permanently removed.
-    if (cleanCode !== '0707') {
-      return { error: 'Code secret ADMIN invalide.' };
-    }
-
-    // 1. Verify via server-side RPC if deployed (server-side IP rate limiting without spoofable client_id)
-    try {
-      const { data: rpcRes, error: rpcErr } = await supabase.rpc('verify_admin_gate', {
-        entered_code: cleanCode
-      });
-      if (!rpcErr && rpcRes && !rpcRes.success) {
-        return { error: rpcRes.error || 'Code secret ADMIN invalide ou trop de tentatives.' };
-      }
-    } catch {
-      // RPC not yet deployed or non-blocking in offline dev
-    }
-
-    const FOUNDER_UUID = '29a23578-640c-434c-bb7c-5b1cb7a30a91';
-
-    const founderUser: any = {
-      id: FOUNDER_UUID,
-      email: ADMIN_EMAIL,
-      user_metadata: {
-        full_name: 'Adanmitonde Junior (Fondateur)',
-        nom: 'Junior',
-        prenom: 'Adanmitonde',
-        role: 'admin',
-        is_fondateur: true,
-        telephone: '+225 0503444508',
-        ville: 'Abidjan',
-        pays: "Côte d'Ivoire"
-      },
-      app_metadata: { role: 'admin' },
-      role: 'authenticated',
-      aud: 'authenticated',
-      created_at: '2026-01-01T00:00:00Z'
-    };
-
-    const founderSession: any = {
-      access_token: 'admin-authenticated-token',
-      token_type: 'bearer',
-      user: founderUser
-    };
-
-    const founderProfile: UserProfile = {
-      id: FOUNDER_UUID,
-      email: ADMIN_EMAIL,
-      full_name: 'Adanmitonde Junior (Fondateur)',
-      nom: 'Junior',
-      prenom: 'Adanmitonde',
-      telephone: '+225 0503444508',
-      role: 'admin',
-      metier: 'Fondateur & Super Administrateur',
-      pays: "Côte d'Ivoire",
-      ville: 'Abidjan',
-      avatar_url: 'https://api.dicebear.com/7.x/initials/svg?seed=Adanmitonde%20Junior&backgroundColor=FF6B00',
-      bio: 'Super Administrateur & Fondateur de la plateforme ArtisanPro Afrique.',
-      is_verified: true,
-      badge_bleu: true,
-      badge_verified: true,
-      is_fondateur: true,
-      created_at: '2026-01-01T00:00:00Z'
-    };
-
-    setSession(founderSession);
-    setUser(founderUser);
-    setProfile(founderProfile);
-    setServerAdminVerified(true);
-    localStorage.setItem('artisanpro_admin_session', 'true');
-    safePersistProfile(`artisanpro_profile_${founderUser.id}`, founderProfile);
-    safePersistProfile('artisanpro_profile_admin-adanmitondejunior07', founderProfile);
-    safePersistProfile('artisanpro_profile_29a23578-640c-434c-bb7c-5b1cb7a30a91', founderProfile);
-    dataStore.saveRegisteredUser(founderProfile);
-
-    // Initialiser en arrière-plan la session Supabase sans bloquer
-    try {
-      supabase.auth.signInWithOtp({ email: ADMIN_EMAIL }).catch(() => {});
-    } catch {}
-
-    loadProfile(founderUser).catch(() => {});
-
-    return { success: true };
+  // Obsolete: Custom secret passcodes removed per security guidelines
+  const signInWithAdminCode = async (_code: string) => {
+    return { error: 'Veuillez vous connecter avec votre adresse e-mail et mot de passe.' };
   };
 
   // Sign Out - Déconnexion immédiate et totale
@@ -1361,10 +1006,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const previousName = profile.full_name;
       const updated: UserProfile = { ...profile, ...updates };
 
-      const isUserAdmin = 
-        isAdmin || 
-        user.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim() ||
-        user.id === 'admin-adanmitondejunior07';
+      const isUserAdmin = isAdmin;
 
       // Utiliser l'identifiant réel de la session Supabase Auth pour que la RLS (auth.uid() = id) autorise l'écriture
       const remoteUserId = session?.user?.id || user.id;
@@ -1372,20 +1014,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // 1. Persist to remote Supabase profiles & profils tables with error checking
       try {
         // Update user metadata in Supabase Auth if session exists
-        if (session?.user && user.id !== 'admin-adanmitondejunior07') {
+        if (session?.user) {
           try {
             await supabase.auth.updateUser({
               data: {
                 full_name: updated.full_name,
+                nom: updated.nom,
+                prenom: updated.prenom,
                 telephone: updated.telephone,
                 pays: updated.pays,
                 ville: updated.ville,
                 metier: updated.metier,
                 avatar_url: updated.avatar_url,
+                photo_url: updated.avatar_url,
                 presentation: updated.bio,
                 bio: updated.bio,
                 adresse_magasin: updated.adresse_magasin,
-                repere_rue: updated.repere_rue
+                adresse: updated.adresse_magasin,
+                repere_rue: updated.repere_rue,
+                rue: updated.repere_rue,
+                gps_lat: updated.gps_lat,
+                gps_lng: updated.gps_lng,
+                gps_label: updated.gps_label
               }
             });
           } catch (authErr) {
@@ -1453,8 +1103,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           } catch {}
         }
       } catch (remoteErr: any) {
-        console.warn('Supabase profile remote sync note:', remoteErr);
-        return { error: 'Erreur inattendue lors de la synchronisation : ' + (remoteErr?.message || 'Erreur réseau') };
+        console.warn(`Supabase profile remote sync note (${SUPABASE_URL}/rest/v1/profiles):`, remoteErr);
+        return { error: `Erreur d'enregistrement : ` + formatFetchError(remoteErr, `${SUPABASE_URL}/rest/v1/profiles`) };
+      }
+
+      // Re-read directly from Supabase immediately after write (Règle stricte : après chaque écriture, relis depuis Supabase)
+      try {
+        const { data: freshAuth } = await supabase.auth.getUser();
+        if (freshAuth?.user) {
+          await loadProfile(freshAuth.user);
+        }
+      } catch (readErr) {
+        console.warn('Re-read from Supabase note:', readErr);
       }
 
       // 2. Synchronize author name on all publications created by this user

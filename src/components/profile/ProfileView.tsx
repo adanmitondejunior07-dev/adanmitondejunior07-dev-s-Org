@@ -31,9 +31,10 @@ import { useAuth } from '../../context/AuthContext';
 import { useOnlineStatus } from '../../hooks/useOnlineStatus';
 import { Publication, UserWallet, ArtisanVerificationRequest } from '../../types';
 import { dataStore } from '../../lib/dataStore';
-import { METIERS_LIST, PAYS_AFRIQUE, ADMIN_EMAIL } from '../../lib/supabase';
+import { METIERS_LIST, PAYS_AFRIQUE, ADMIN_EMAIL, SUPABASE_URL } from '../../lib/supabase';
 import { PostText } from '../social/PostText';
 import { VerificationModal } from '../verification/VerificationModal';
+import { uploadProfilePhotoToSupabase } from '../../lib/storageHelper';
 
 interface ProfileViewProps {
   onOpenSettings: () => void;
@@ -77,6 +78,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [editVille, setEditVille] = useState(profile?.ville || 'Abidjan');
   const [editAdresseMagasin, setEditAdresseMagasin] = useState(profile?.adresse_magasin || '');
   const [editRepereRue, setEditRepereRue] = useState(profile?.repere_rue || '');
+  const [editGpsLat, setEditGpsLat] = useState<number | undefined>(profile?.gps_lat);
+  const [editGpsLng, setEditGpsLng] = useState<number | undefined>(profile?.gps_lng);
+  const [editGpsLabel, setEditGpsLabel] = useState<string>(profile?.gps_label || '');
+  const [isLocating, setIsLocating] = useState<boolean>(false);
+  const [isUploadingPhoto, setIsUploadingPhoto] = useState<boolean>(false);
   const [editMetier, setEditMetier] = useState(profile?.metier || 'Couturier');
   const [editBio, setEditBio] = useState(profile?.bio || '');
   const [editAvatar, setEditAvatar] = useState(profile?.avatar_url || '');
@@ -98,6 +104,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       setEditVille(profile.ville && profile.ville !== 'Afrique 🌍' && profile.ville !== 'Afrique' ? profile.ville : 'Abidjan');
       setEditAdresseMagasin(profile.adresse_magasin || '');
       setEditRepereRue(profile.repere_rue || '');
+      setEditGpsLat(profile.gps_lat);
+      setEditGpsLng(profile.gps_lng);
+      setEditGpsLabel(profile.gps_label || '');
       setEditMetier(profile.metier && profile.metier !== 'Membre' && profile.metier !== 'Nouvel Artisan' ? profile.metier : (profile.role === 'artisan' ? 'Couturier' : 'Membre'));
       setEditBio(profile.bio || '');
       setEditAvatar(profile.avatar_url || '');
@@ -197,23 +206,100 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     });
   };
 
-  // Direct Gallery Photo Picker Handler
-  const handleDirectAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Geolocation detection handler
+  const handleDetectGps = () => {
+    if (!navigator.geolocation) {
+      showToast("La géolocalisation n'est pas supportée par votre navigateur.");
+      return;
+    }
+    setIsLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(6));
+        const lng = Number(pos.coords.longitude.toFixed(6));
+        setEditGpsLat(lat);
+        setEditGpsLng(lng);
+        setIsLocating(false);
+        showToast(`Position GPS capturée : ${lat}, ${lng}`);
+      },
+      (err) => {
+        setIsLocating(false);
+        console.warn('Geolocation error:', err);
+        showToast("Impossible d'accéder au GPS. Veuillez autoriser la localisation.");
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+    );
+  };
+
+  // Direct Gallery Photo Picker Handler with Supabase Storage upload
+  const handleDirectAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const rawDataUrl = event.target?.result as string;
-      if (rawDataUrl) {
-        const optimized = await compressAvatar(rawDataUrl);
-        setEditAvatar(optimized);
-        await updateProfile({ avatar_url: optimized });
-        showToast('Photo de profil enregistrée avec succès !');
-      }
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+    try {
+      setIsUploadingPhoto(true);
+      showToast('Téléversement vers Supabase Storage...');
+
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const rawDataUrl = event.target?.result as string;
+        if (rawDataUrl) {
+          const optimized = await compressAvatar(rawDataUrl);
+          const currentUid = profile?.id || user?.id || 'me';
+          let storageUrl = optimized;
+          try {
+            storageUrl = await uploadProfilePhotoToSupabase(optimized, currentUid);
+          } catch (stErr) {
+            console.warn('Supabase Storage direct note:', stErr);
+          }
+          setEditAvatar(storageUrl);
+          await updateProfile({ avatar_url: storageUrl });
+          showToast('Photo de profil enregistrée dans Supabase Storage !');
+          setIsUploadingPhoto(false);
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (err: any) {
+      setIsUploadingPhoto(false);
+      showToast(err.message || 'Erreur lors du téléversement');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  // Modal Photo Picker Handler with Supabase Storage upload
+  const handleModalPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      setIsUploadingPhoto(true);
+      showToast('Téléversement vers Supabase Storage...');
+
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const dataUrl = ev.target?.result as string;
+        if (dataUrl) {
+          const optimized = await compressAvatar(dataUrl);
+          const currentUid = profile?.id || user?.id || 'me';
+          let storageUrl = optimized;
+          try {
+            storageUrl = await uploadProfilePhotoToSupabase(optimized, currentUid);
+          } catch (stErr) {
+            console.warn('Supabase Storage modal note:', stErr);
+          }
+          setEditAvatar(storageUrl);
+          showToast('Photo téléversée dans Supabase Storage !');
+          setIsUploadingPhoto(false);
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (err: any) {
+      setIsUploadingPhoto(false);
+      showToast(err.message || 'Erreur lors du téléversement');
+    } finally {
+      e.target.value = '';
+    }
   };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -229,6 +315,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         ville: editVille.trim(),
         adresse_magasin: editAdresseMagasin.trim() || undefined,
         repere_rue: editRepereRue.trim() || undefined,
+        gps_lat: editGpsLat !== undefined && !isNaN(Number(editGpsLat)) ? Number(editGpsLat) : undefined,
+        gps_lng: editGpsLng !== undefined && !isNaN(Number(editGpsLng)) ? Number(editGpsLng) : undefined,
+        gps_label: editGpsLabel.trim() || undefined,
         metier: !isAdmin && profile?.role === 'artisan' ? editMetier : undefined,
         bio: editBio.trim(),
         avatar_url: editAvatar.trim() || undefined
@@ -236,7 +325,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
       if (res.success) {
         setUpdateSuccess(true);
-        showToast('Profil enregistré avec succès !');
+        showToast('Profil enregistré avec succès dans Supabase !');
         setTimeout(() => {
           setShowEditModal(false);
           setUpdateSuccess(false);
@@ -245,7 +334,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         showToast(res.error);
       }
     } catch (err: any) {
-      showToast(err.message || 'Erreur lors de la mise à jour');
+      showToast(`Échec d'enregistrement (${SUPABASE_URL}/rest/v1/profiles) : ${err.message || 'Erreur réseau'}`);
     } finally {
       setIsUpdating(false);
     }
@@ -373,23 +462,45 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               )}
             </div>
 
-            {/* Localisation des rues ou adresse complète du magasin */}
-            {(profile?.adresse_magasin || profile?.repere_rue) && (
+            {/* Localisation des rues, adresse complète et coordonnées GPS */}
+            {(profile?.adresse_magasin || profile?.repere_rue || (profile?.gps_lat && profile?.gps_lng)) && (
               <div className="pt-2">
-                <div className="p-2.5 rounded-2xl bg-orange-50/80 border border-orange-100 flex items-start gap-2 text-xs">
-                  <MapPin className="w-4 h-4 text-[#FF6B00] shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    {profile.adresse_magasin && (
-                      <p className="font-bold text-neutral-900 leading-snug">
-                        {profile.adresse_magasin}
-                      </p>
-                    )}
-                    {profile.repere_rue && (
-                      <p className="text-[11px] text-neutral-600 mt-0.5">
-                        <span className="font-semibold text-neutral-800">Repère / Rue :</span> {profile.repere_rue}
-                      </p>
-                    )}
-                  </div>
+                <div className="p-3 rounded-2xl bg-orange-50/80 border border-orange-100 flex flex-col gap-2 text-xs">
+                  {(profile.adresse_magasin || profile.repere_rue) && (
+                    <div className="flex items-start gap-2">
+                      <MapPin className="w-4 h-4 text-[#FF6B00] shrink-0 mt-0.5" />
+                      <div className="min-w-0 flex-1">
+                        {profile.adresse_magasin && (
+                          <p className="font-bold text-neutral-900 leading-snug">
+                            {profile.adresse_magasin}
+                          </p>
+                        )}
+                        {profile.repere_rue && (
+                          <p className="text-[11px] text-neutral-600 mt-0.5">
+                            <span className="font-semibold text-neutral-800">Repère / Rue :</span> {profile.repere_rue}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {profile.gps_lat && profile.gps_lng && (
+                    <div className="pt-2 border-t border-orange-200/60 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-[11px] text-neutral-700 font-medium">
+                        <Navigation className="w-3.5 h-3.5 text-[#FF6B00]" />
+                        <span>GPS : {Number(profile.gps_lat).toFixed(5)}, {Number(profile.gps_lng).toFixed(5)}</span>
+                      </div>
+                      <a
+                        href={`https://www.google.com/maps?q=${profile.gps_lat},${profile.gps_lng}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-1 px-2.5 rounded-lg bg-[#FF6B00] hover:bg-[#e05e00] text-white text-[10px] font-bold inline-flex items-center gap-1 shadow-xs transition-colors"
+                      >
+                        <MapPin className="w-2.5 h-2.5" />
+                        <span>Ouvrir sur Maps ↗</span>
+                      </a>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -824,19 +935,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     ref={modalFileInputRef}
                     type="file"
                     accept="image/*"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      const reader = new FileReader();
-                      reader.onload = (ev) => {
-                        const dataUrl = ev.target?.result as string;
-                        if (dataUrl) {
-                          setEditAvatar(dataUrl);
-                          showToast('Photo chargée depuis votre galerie !');
-                        }
-                      };
-                      reader.readAsDataURL(file);
-                    }}
+                    onChange={handleModalPhotoUpload}
                     className="hidden"
                   />
                   <button
@@ -968,6 +1067,64 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   placeholder="Ex: En face de la Pharmacie Centrale, à 50m du grand marché"
                   className="w-full px-3 py-2.5 rounded-xl border border-neutral-300 text-xs focus:outline-hidden focus:border-[#FF6B00]"
                 />
+              </div>
+
+              {/* Coordonnées GPS avec géolocalisation en 1 clic */}
+              <div className="p-3.5 rounded-2xl bg-orange-50/70 border border-orange-200/80 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-neutral-800 flex items-center gap-1.5">
+                    <Navigation className="w-3.5 h-3.5 text-[#FF6B00]" />
+                    <span>Position GPS (Coordonnées)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleDetectGps}
+                    disabled={isLocating}
+                    className="py-1 px-2.5 rounded-lg bg-[#FF6B00] hover:bg-[#e05e00] text-white text-[10px] font-bold inline-flex items-center gap-1 shadow-xs transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <Navigation className={`w-3 h-3 ${isLocating ? 'animate-spin' : ''}`} />
+                    <span>{isLocating ? 'Détection...' : '📍 Détecter ma position GPS'}</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <span className="block text-[10px] text-neutral-500 font-semibold mb-0.5">Latitude</span>
+                    <input
+                      type="number"
+                      step="any"
+                      placeholder="Ex: 5.359952"
+                      value={editGpsLat ?? ''}
+                      onChange={(e) => setEditGpsLat(e.target.value ? parseFloat(e.target.value) : undefined)}
+                      className="w-full px-2.5 py-2 rounded-xl border border-neutral-300 bg-white text-xs focus:outline-hidden focus:border-[#FF6B00]"
+                    />
+                  </div>
+                  <div>
+                    <span className="block text-[10px] text-neutral-500 font-semibold mb-0.5">Longitude</span>
+                    <input
+                      type="number"
+                      step="any"
+                      placeholder="Ex: -4.008256"
+                      value={editGpsLng ?? ''}
+                      onChange={(e) => setEditGpsLng(e.target.value ? parseFloat(e.target.value) : undefined)}
+                      className="w-full px-2.5 py-2 rounded-xl border border-neutral-300 bg-white text-xs focus:outline-hidden focus:border-[#FF6B00]"
+                    />
+                  </div>
+                </div>
+
+                {editGpsLat !== undefined && editGpsLng !== undefined && (
+                  <div className="text-[10px] text-neutral-600 flex items-center justify-between pt-1 border-t border-orange-200/50">
+                    <span>Position enregistrée : {Number(editGpsLat).toFixed(5)}, {Number(editGpsLng).toFixed(5)}</span>
+                    <a
+                      href={`https://www.google.com/maps?q=${editGpsLat},${editGpsLng}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[#FF6B00] hover:underline font-bold"
+                    >
+                      Ouvrir sur Maps ↗
+                    </a>
+                  </div>
+                )}
               </div>
 
               <div>

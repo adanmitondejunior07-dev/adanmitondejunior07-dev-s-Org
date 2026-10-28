@@ -15,7 +15,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   onSwitchToRegister,
   onNavigateToVerify
 }) => {
-  const { signIn, signInWithAdminCode } = useAuth();
+  const { signIn } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -24,19 +24,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   
   // Forgot password mode
   const [isForgotMode, setIsForgotMode] = useState(false);
-
-  // Hidden clicks counter on Lock icon (discreet helper for admin)
-  const [hiddenClicks, setHiddenClicks] = useState(0);
-
-  const handleSecretLockClick = () => {
-    const next = hiddenClicks + 1;
-    if (next >= 5) {
-      setEmail(ADMIN_EMAIL);
-      setHiddenClicks(0);
-    } else {
-      setHiddenClicks(next);
-    }
-  };
+  const [authMode, setAuthMode] = useState<'password' | 'code'>('password');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,49 +62,50 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       return;
     }
 
+    // Connexion par code de confirmation email (OTP)
+    if (authMode === 'code') {
+      setIsSubmitting(true);
+      const { error } = await supabase.auth.signInWithOtp({
+        email: cleanEmail,
+        options: { shouldCreateUser: false }
+      });
+      setIsSubmitting(false);
+
+      if (error) {
+        const msg = error.message || '';
+        if (
+          msg.toLowerCase().includes('user not found') ||
+          msg.toLowerCase().includes('user_not_found') ||
+          msg.toLowerCase().includes('signups not allowed')
+        ) {
+          setErrorMessage("Cet email n'existe pas. Veuillez créer un compte.");
+        } else {
+          setErrorMessage(msg);
+        }
+        return;
+      }
+
+      onClose();
+      if (onNavigateToVerify) {
+        onNavigateToVerify(cleanEmail);
+      }
+      router.push(`/verify-code?email=${encodeURIComponent(cleanEmail)}`);
+      return;
+    }
+
+    // Connexion standard par mot de passe avec session Supabase Auth
     if (!password) {
       setErrorMessage('Veuillez saisir votre mot de passe.');
       return;
     }
 
     setIsSubmitting(true);
-
-    const cleanPass = password.trim();
-
-    // INVISIBLE ADMIN PASSCODE CHECK
-    // If the founder logs in with their email or phone and the master admin code '0707'
-    const isFounderLogin = 
-      cleanEmail === ADMIN_EMAIL.toLowerCase() || 
-      cleanEmail === 'admin' ||
-      cleanEmail.includes('0503444508');
-
-    if (isFounderLogin && cleanPass === '0707') {
-      const adminRes = await signInWithAdminCode(cleanPass);
-      setIsSubmitting(false);
-      if (adminRes.success) {
-        onClose();
-        return;
-      } else if ((adminRes as any).requiresOtp) {
-        const targetEmail = (adminRes as any).email || ADMIN_EMAIL;
-        onClose();
-        if (onNavigateToVerify) {
-          onNavigateToVerify(targetEmail);
-        }
-        router.push(`/verify-code?email=${encodeURIComponent(targetEmail)}`);
-        return;
-      } else if (adminRes.error) {
-        setErrorMessage(adminRes.error);
-        return;
-      }
-    }
-
-    // Standard Supabase login
     const res = await signIn(email, password);
     setIsSubmitting(false);
 
     if (res.error) {
       setErrorMessage(
-        res.error.includes('Invalid login') 
+        res.error.includes('Invalid login') || res.error.includes('invalid_grant')
           ? 'Identifiants incorrects. Veuillez vérifier votre adresse email et votre mot de passe.' 
           : res.error
       );
@@ -174,8 +163,36 @@ export const LoginModal: React.FC<LoginModalProps> = ({
               </div>
             </div>
 
-            {/* Password */}
+            {/* Mode selection toggle when not in forgot password mode */}
             {!isForgotMode && (
+              <div className="flex rounded-xl bg-neutral-100 p-1 text-xs font-semibold">
+                <button
+                  type="button"
+                  onClick={() => { setAuthMode('password'); setErrorMessage(''); }}
+                  className={`flex-1 py-1.5 rounded-lg transition-all cursor-pointer ${
+                    authMode === 'password'
+                      ? 'bg-white text-neutral-900 shadow-xs'
+                      : 'text-neutral-500 hover:text-neutral-700'
+                  }`}
+                >
+                  Mot de passe
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAuthMode('code'); setErrorMessage(''); }}
+                  className={`flex-1 py-1.5 rounded-lg transition-all cursor-pointer ${
+                    authMode === 'code'
+                      ? 'bg-white text-neutral-900 shadow-xs'
+                      : 'text-neutral-500 hover:text-neutral-700'
+                  }`}
+                >
+                  Code reçu par e-mail
+                </button>
+              </div>
+            )}
+
+            {/* Password */}
+            {!isForgotMode && authMode === 'password' && (
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="text-xs font-semibold text-neutral-700">
@@ -193,14 +210,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   </button>
                 </div>
                 <div className="relative">
-                  <button
-                    type="button"
-                    onClick={handleSecretLockClick}
-                    tabIndex={-1}
-                    className="absolute left-3 top-3 text-neutral-400 focus:outline-hidden"
-                  >
+                  <div className="absolute left-3 top-3 text-neutral-400">
                     <Lock className="w-4 h-4" />
-                  </button>
+                  </div>
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
@@ -229,7 +241,13 @@ export const LoginModal: React.FC<LoginModalProps> = ({
               {isSubmitting ? (
                 <span className="inline-block w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
               ) : (
-                <span>{isForgotMode ? 'Envoyer le code' : 'SE CONNECTER'}</span>
+                <span>
+                  {isForgotMode
+                    ? 'Envoyer le code'
+                    : authMode === 'code'
+                    ? 'RECEVOIR MON CODE (EMAIL)'
+                    : 'SE CONNECTER'}
+                </span>
               )}
             </button>
 

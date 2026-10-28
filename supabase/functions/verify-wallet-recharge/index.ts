@@ -10,7 +10,7 @@ const ADMIN_EMAIL = 'adanmitondejunior07@gmail.com';
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
+    return new Response('ok', { status: 200, headers: corsHeaders });
   }
 
   try {
@@ -178,18 +178,58 @@ serve(async (req) => {
         }
       });
 
+      let errorText = '';
+      let isNotFound = false;
+
       if (gpResponse.ok) {
         gpData = await gpResponse.json();
         gpFetchOk = true;
+
+        if (
+          gpData?.code === 'TRANSACTION_NOT_FOUND' ||
+          gpData?.error === 'TRANSACTION_NOT_FOUND' ||
+          gpData?.status === 'TRANSACTION_NOT_FOUND' ||
+          gpData?.data?.status === 'TRANSACTION_NOT_FOUND'
+        ) {
+          isNotFound = true;
+        }
       } else {
-        const errorText = await gpResponse.text();
+        errorText = await gpResponse.text();
         console.warn('API GeniusPay statut non-200:', gpResponse.status, errorText);
+
+        let errJson: any = null;
+        try { errJson = JSON.parse(errorText); } catch {}
+
+        if (
+          errorText.includes('TRANSACTION_NOT_FOUND') ||
+          errJson?.code === 'TRANSACTION_NOT_FOUND' ||
+          errJson?.error === 'TRANSACTION_NOT_FOUND' ||
+          errJson?.message === 'TRANSACTION_NOT_FOUND' ||
+          (errJson?.message && String(errJson.message).toUpperCase().includes('NOT_FOUND')) ||
+          gpResponse.status === 404
+        ) {
+          isNotFound = true;
+        }
+      }
+
+      // En sandbox, si verify-wallet-recharge reçoit TRANSACTION_NOT_FOUND, laisse le statut pending.
+      if (isNotFound) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            status: 'pending',
+            is_paid: false,
+            message: 'Transaction en attente de validation (TRANSACTION_NOT_FOUND). Statut maintenu en pending.',
+            reference: transaction.reference
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
       }
     } catch (networkErr: any) {
       console.error('Erreur réseau appel API GeniusPay:', networkErr);
     }
 
-    // Exigence 5 : Si GeniusPay ne répond pas ou renvoie une erreur -> NE JAMAIS CRÉDITER
+    // Si GeniusPay ne répond pas ou renvoie une erreur -> NE JAMAIS CRÉDITER
     if (!gpFetchOk || !gpData) {
       return new Response(
         JSON.stringify({

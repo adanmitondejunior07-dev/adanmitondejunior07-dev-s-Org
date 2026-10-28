@@ -27,6 +27,7 @@ import { AppNotification, ArtisanVerificationRequest } from '../../types';
 import { dataStore } from '../../lib/dataStore';
 import { SubscriptionPlansView } from '../subscription/SubscriptionPlansView';
 import { SocialMediaBar } from '../navigation/SocialLinks';
+import { router } from '../../lib/router';
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -381,13 +382,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, initialSe
           {/* ACCOUNT SETTINGS */}
           {currentSection === 'account' && (
             <div className="space-y-4">
-              <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200/60 space-y-2">
+              <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200/60 space-y-3">
                 <h4 className="font-bold text-neutral-900">Identifiants de connexion</h4>
                 <p className="text-neutral-600">Email enregistré : <strong>{profile?.email}</strong></p>
                 <p className="text-neutral-600">ID unique : <code className="bg-white px-1 py-0.5 rounded-sm border">{profile?.id.slice(0, 12)}...</code></p>
-              </div>
-              <div className="p-3 bg-amber-50 rounded-2xl border border-amber-200 text-amber-900">
-                Pour modifier votre mot de passe, utilisez la fonction <em>Mot de passe oublié</em> sur la page de connexion ou contactez le support.
+                
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    router.push('/nouveau-mot-de-passe');
+                  }}
+                  className="w-full py-3 px-4 rounded-2xl bg-[#FF6B1A] hover:bg-[#e05e00] text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-xs"
+                >
+                  <Lock className="w-4 h-4" />
+                  <span>Changer mon mot de passe</span>
+                </button>
               </div>
 
               <div className="pt-2">

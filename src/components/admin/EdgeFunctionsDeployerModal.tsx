@@ -96,16 +96,13 @@ export const EdgeFunctionsDeployerModal: React.FC<EdgeFunctionsDeployerModalProp
         } catch {}
       }
 
-      // Si la session utilise l'authentification administrateur maître ou si le token JWT local est absent
-      if (!accessToken) {
-        accessToken = 'admin-authenticated-token';
-      }
-
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Bearer ${accessToken}`
+        'Accept': 'application/json'
       };
+      if (accessToken) {
+        headers['Authorization'] = `Bearer ${accessToken}`;
+      }
 
       const payloadString = JSON.stringify({
         token: token.trim(),

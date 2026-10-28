@@ -22,7 +22,8 @@ import {
 import { VideoItem } from '../../types';
 import { dataStore } from '../../lib/dataStore';
 import { useAuth } from '../../context/AuthContext';
-import { METIERS_LIST, ADMIN_EMAIL } from '../../lib/supabase';
+import { supabase, METIERS_LIST, ADMIN_EMAIL } from '../../lib/supabase';
+import { uploadPublicationMediaToSupabase } from '../../lib/storageHelper';
 import { copyToClipboard } from '../../lib/utils';
 import { compressImageFile } from '../../lib/mediaCompressor';
 
@@ -64,6 +65,7 @@ export const VideoFeed: React.FC = () => {
   // New video modal state
   const [newTitle, setNewTitle] = useState('');
   const [newVideoUrl, setNewVideoUrl] = useState('');
+  const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
   const [newPosterUrl, setNewPosterUrl] = useState('');
   const [newMetier, setNewMetier] = useState<string>(METIERS_LIST[0]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -73,6 +75,7 @@ export const VideoFeed: React.FC = () => {
   const [editTitle, setEditTitle] = useState('');
   const [editMetier, setEditMetier] = useState('');
   const [editVideoUrl, setEditVideoUrl] = useState('');
+  const [editSelectedVideoFile, setEditSelectedVideoFile] = useState<File | null>(null);
   const [isUpdatingVideo, setIsUpdatingVideo] = useState(false);
   const editVideoFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -129,16 +132,30 @@ export const VideoFeed: React.FC = () => {
     if (!currentVideo || !editTitle.trim()) return;
     setIsUpdatingVideo(true);
     try {
-      const updated = await dataStore.updateVideo(currentVideo.id, {
-        title: editTitle.trim(),
-        metier: editMetier,
-        video_url: editVideoUrl.trim() || currentVideo.video_url
-      });
-      if (updated) {
-        setVideos(prev => prev.map(v => v.id === currentVideo.id ? { ...v, ...updated } : v));
-        showToast('Vidéo modifiée avec succès !');
-        setShowEditModal(false);
+      let finalUrl = editVideoUrl.trim() || currentVideo.video_url;
+      if (editSelectedVideoFile && (user?.id || profile?.id)) {
+        finalUrl = await uploadPublicationMediaToSupabase(editSelectedVideoFile, user?.id || profile?.id || 'artisan', 'video');
       }
+
+      const { error } = await supabase
+        .from('publications')
+        .update({
+          content: editTitle.trim(),
+          media_url: finalUrl
+        })
+        .eq('id', currentVideo.id);
+
+      if (error) {
+        throw error;
+      }
+
+      await loadVideos();
+      showToast('Vidéo modifiée avec succès !');
+      setShowEditModal(false);
+      setEditSelectedVideoFile(null);
+    } catch (err) {
+      console.error('Failed to update video:', err);
+      showToast('Erreur lors de la modification de la vidéo');
     } finally {
       setIsUpdatingVideo(false);
     }
@@ -147,15 +164,10 @@ export const VideoFeed: React.FC = () => {
   const handleEditVideoFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        setEditVideoUrl(dataUrl);
-        showToast('Nouvelle vidéo sélectionnée !');
-      }
-    };
-    reader.readAsDataURL(file);
+    setEditSelectedVideoFile(file);
+    const previewUrl = URL.createObjectURL(file);
+    setEditVideoUrl(previewUrl);
+    showToast('Nouvelle vidéo prête pour Supabase Storage !');
     e.target.value = '';
   };
 
@@ -163,15 +175,10 @@ export const VideoFeed: React.FC = () => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        setNewVideoUrl(dataUrl);
-        showToast('Vidéo chargée depuis votre galerie !');
-      }
-    };
-    reader.readAsDataURL(file);
+    setSelectedVideoFile(file);
+    const previewUrl = URL.createObjectURL(file);
+    setNewVideoUrl(previewUrl);
+    showToast('Vidéo prête pour Supabase Storage !');
     e.target.value = '';
   };
 
@@ -182,14 +189,83 @@ export const VideoFeed: React.FC = () => {
     const dataUrl = await compressImageFile(file, 800, 0.8);
     if (dataUrl) {
       setNewPosterUrl(dataUrl);
-      showToast('Image de couverture chargée !');
+      showToast('Image de couverture prête !');
     }
     e.target.value = '';
   };
 
+  const loadVideos = async () => {
+    try {
+      // 1. Lire directement depuis Supabase la table 'publications' où media_type = 'video'
+      const { data: supaVideos, error: vidErr } = await supabase
+        .from('publications')
+        .select('*')
+        .eq('media_type', 'video')
+        .order('created_at', { ascending: false });
+
+      // 2. Lire les mentions j'aime
+      const { data: likesData } = await supabase
+        .from('likes')
+        .select('post_id, user_id');
+
+      const likesCountMap = new Map<string, number>();
+      const userLikedSet = new Set<string>();
+      const effectiveUserId = user?.id || profile?.id;
+
+      if (likesData) {
+        for (const l of likesData) {
+          if (l.post_id) {
+            likesCountMap.set(l.post_id, (likesCountMap.get(l.post_id) || 0) + 1);
+            if (effectiveUserId && l.user_id === effectiveUserId) {
+              userLikedSet.add(l.post_id);
+            }
+          }
+        }
+      }
+
+      const formatted: VideoItem[] = (supaVideos || []).map((p: any) => ({
+        id: p.id,
+        title: p.content || 'Réalisation artisanale en vidéo',
+        video_url: p.media_url,
+        poster_url: undefined,
+        artisan_name: p.artisan_name || 'Artisan ArtisanPro',
+        artisan_avatar: p.artisan_avatar || undefined,
+        metier: 'Artisan',
+        ville: p.location || 'Afrique',
+        likes_count: likesCountMap.get(p.id) || 0,
+        comments_count: 0,
+        created_at: p.created_at,
+        user_id: p.user_id,
+        is_liked: userLikedSet.has(p.id)
+      }));
+
+      if (formatted.length === 0) {
+        // Presets visuels africains initiaux
+        const presets: VideoItem[] = VIDEO_PRESETS.map((vp, idx) => ({
+          id: `preset-${idx}`,
+          title: vp.title,
+          video_url: vp.url,
+          poster_url: vp.poster,
+          artisan_name: `Artisan ${vp.metier}`,
+          metier: vp.metier,
+          ville: 'Abidjan',
+          likes_count: 0,
+          comments_count: 0,
+          created_at: new Date().toISOString(),
+          is_liked: false
+        }));
+        setVideos(presets);
+      } else {
+        setVideos(formatted);
+      }
+    } catch (e) {
+      console.warn('Erreur chargement vidéos Supabase:', e);
+    }
+  };
+
   useEffect(() => {
-    dataStore.getVideos(profile?.id).then(vids => setVideos(vids));
-  }, [profile?.id]);
+    loadVideos();
+  }, [profile?.id, user?.id]);
 
   useEffect(() => {
     setVideoError(false);
@@ -227,28 +303,57 @@ export const VideoFeed: React.FC = () => {
   };
 
   const handleLike = async (vidId: string) => {
-    if (!profile && !user) {
-      showToast('Connectez-vous pour aimer cette vidéo');
-      return;
-    }
     const effectiveUserId = profile?.id || user?.id;
     if (!effectiveUserId) {
       showToast('Connectez-vous pour aimer cette vidéo');
       return;
     }
-    const res = await dataStore.toggleVideoLike(vidId, effectiveUserId);
+
+    const currentVid = videos.find(v => v.id === vidId);
+    if (!currentVid) return;
+
+    const prevLiked = Boolean(currentVid.is_liked);
+    const prevCount = Number(currentVid.likes_count || 0);
+    const nextLiked = !prevLiked;
+    const nextCount = nextLiked ? prevCount + 1 : Math.max(0, prevCount - 1);
+
+    // Optimistic UI update
     setVideos(prev =>
-      prev.map(v => {
-        if (v.id === vidId) {
-          return {
-            ...v,
-            is_liked: res.isLiked,
-            likes_count: res.count
-          };
-        }
-        return v;
-      })
+      prev.map(v => (v.id === vidId ? { ...v, is_liked: nextLiked, likes_count: nextCount } : v))
     );
+
+    try {
+      if (prevLiked) {
+        await supabase
+          .from('likes')
+          .delete()
+          .eq('post_id', vidId)
+          .eq('user_id', effectiveUserId);
+      } else {
+        await supabase
+          .from('likes')
+          .insert({
+            post_id: vidId,
+            user_id: effectiveUserId
+          });
+      }
+
+      const { count } = await supabase
+        .from('likes')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', vidId);
+
+      if (typeof count === 'number') {
+        setVideos(prev =>
+          prev.map(v => (v.id === vidId ? { ...v, likes_count: count } : v))
+        );
+      }
+    } catch (err) {
+      setVideos(prev =>
+        prev.map(v => (v.id === vidId ? { ...v, is_liked: prevLiked, likes_count: prevCount } : v))
+      );
+      showToast('Erreur lors de l\'enregistrement de votre mention J\'aime');
+    }
   };
 
   const handleShare = async () => {
@@ -274,17 +379,18 @@ export const VideoFeed: React.FC = () => {
 
     const vidId = currentVideo.id;
     try {
-      await dataStore.deleteVideo(vidId);
-      setVideos(prev => {
-        const filtered = prev.filter(v => v.id !== vidId);
-        if (currentIndex >= filtered.length) {
-          setCurrentIndex(Math.max(0, filtered.length - 1));
-        }
-        return filtered;
-      });
+      // Vrai delete sur Supabase
+      const { error } = await supabase.from('publications').delete().eq('id', vidId);
+      if (error) {
+        console.warn('Supabase delete error:', error);
+      }
+      // Rechargement immédiat depuis Supabase
+      await loadVideos();
+      setCurrentIndex(0);
       showToast('Vidéo supprimée avec succès !');
     } catch (err) {
       console.error('Failed to delete video:', err);
+      showToast('Erreur lors de la suppression de la vidéo');
     }
   };
 
@@ -292,29 +398,54 @@ export const VideoFeed: React.FC = () => {
     e.preventDefault();
     if (!newTitle.trim() || !newVideoUrl.trim()) return;
 
+    const effectiveUserId = user?.id || profile?.id;
+    if (!effectiveUserId) {
+      showToast('Connectez-vous pour publier une vidéo');
+      return;
+    }
+
     setIsSubmitting(true);
     try {
-      const added = await dataStore.addVideo({
-        title: newTitle.trim(),
-        video_url: newVideoUrl.trim(),
-        poster_url: newPosterUrl.trim() || undefined,
-        artisan_name: profile?.full_name || 'Artisan Créateur',
-        artisan_avatar: profile?.avatar_url,
-        metier: newMetier,
-        ville: profile?.ville || 'Afrique',
-        user_id: profile?.id,
-        artisan_id: profile?.id
-      });
+      let finalVideoUrl = newVideoUrl.trim();
+      if (selectedVideoFile) {
+        // Envoi direct dans Supabase Storage
+        finalVideoUrl = await uploadPublicationMediaToSupabase(selectedVideoFile, effectiveUserId, 'video');
+      }
 
-      setVideos(prev => [added, ...prev]);
+      // Vrai insert dans Supabase publications avec media_type = 'video'
+      const generatedUuid = crypto.randomUUID();
+      const { error: insErr } = await supabase
+        .from('publications')
+        .insert({
+          id: generatedUuid,
+          user_id: effectiveUserId,
+          artisan_name: profile?.full_name || 'Artisan Créateur',
+          artisan_avatar: profile?.avatar_url || null,
+          location: profile?.ville ? `${profile.ville}, ${profile.pays || 'Afrique'}` : 'Afrique',
+          content: newTitle.trim(),
+          media_url: finalVideoUrl,
+          media_type: 'video',
+          created_at: new Date().toISOString()
+        });
+
+      if (insErr) {
+        throw insErr;
+      }
+
+      // Rechargement immédiat depuis Supabase
+      await loadVideos();
+
       setCurrentIndex(0);
       setVideoError(false);
       setIsPlaying(true);
       setShowAddModal(false);
       setNewTitle('');
       setNewVideoUrl('');
-      setNewPosterUrl('');
+      setSelectedVideoFile(null);
       showToast('Vidéo publiée avec succès !');
+    } catch (err: any) {
+      console.error('Erreur publication vidéo:', err);
+      showToast('Erreur lors de la publication de la vidéo sur le serveur');
     } finally {
       setIsSubmitting(false);
     }

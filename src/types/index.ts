@@ -28,6 +28,7 @@ export interface UserProfile {
   suspended?: boolean;
   subscription_plan?: 'essentiel' | 'pro' | 'premium_vip';
   subscription_period?: 'mensuel' | 'annuel';
+  subscription_expires_at?: string;
   gps_lat?: number;
   gps_lng?: number;
   gps_label?: string;

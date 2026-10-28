@@ -3,11 +3,14 @@ process.env.DISABLE_HMR = 'true';
 import express from 'express';
 import http from 'http';
 import fs from 'fs';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { exec } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,9 +62,12 @@ async function startServer() {
 
   // 2. Parser JSON tolérant acceptant application/json, variantes json et text/plain
   app.use(express.json({
-    limit: '2mb',
+    limit: '5mb',
     strict: false,
-    type: ['application/json', 'application/*+json', 'text/plain']
+    type: ['application/json', 'application/*+json', 'text/plain'],
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf.toString('utf-8');
+    }
   }));
 
   // 3. Gestionnaire d'erreurs de parsing dédié pour l'API (ex: 415 type non supporté, 400 syntaxe JSON)
@@ -81,6 +87,105 @@ async function startServer() {
       success: false,
       error: `[Erreur API ${status}] ${message}`
     });
+  });
+
+  // POST /api/change-password : Changement de mot de passe sécurisé via jeton de session Supabase
+  app.post('/api/change-password', async (req, res) => {
+    try {
+      // 1. Vérification de l'en-tête Authorization
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session requise. En-tête Authorization manquant ou invalide.'
+        });
+      }
+
+      const accessToken = authHeader.replace(/^Bearer\s+/i, '').trim();
+      if (!accessToken || accessToken.length < 20) {
+        return res.status(401).json({
+          success: false,
+          error: 'Jeton de session invalide ou vide.'
+        });
+      }
+
+      // 2. Validation du mot de passe fourni (minimum 8 caractères)
+      const body = req.body || {};
+      const newPassword = typeof body.password === 'string' 
+        ? body.password 
+        : typeof body.newPassword === 'string' 
+          ? body.newPassword 
+          : typeof body.new_password === 'string' 
+            ? body.new_password 
+            : '';
+
+      if (!newPassword || newPassword.length < 8) {
+        return res.status(400).json({
+          success: false,
+          error: 'Le mot de passe doit comporter au moins 8 caractères.'
+        });
+      }
+
+      // 3. Vérification cryptographique du jeton auprès de Supabase
+      // L'identifiant de l'utilisateur est extrait UNIQUEMENT de ce jeton validé
+      const { data: userData, error: userError } = await supabaseAuthClient.auth.getUser(accessToken);
+
+      if (userError || !userData?.user?.id) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session expirée ou non autorisée auprès de Supabase. Veuillez vous reconnecter.'
+        });
+      }
+
+      const verifiedUserId = userData.user.id;
+
+      // 4. Lecture de la clé service_role uniquement depuis les Secrets / variables d'environnement côté serveur
+      const serviceRoleKey = (
+        process.env.SUPABASE_SERVICE_ROLE_KEY || 
+        process.env.SERVICE_ROLE_KEY || 
+        ''
+      ).trim().replace(/^["']+|["']+$/g, '');
+
+      if (!serviceRoleKey) {
+        console.error('[SECURITE] Clé service_role manquante côté serveur (SUPABASE_SERVICE_ROLE_KEY)');
+        return res.status(500).json({
+          success: false,
+          error: 'Configuration serveur incomplète : clé de gestion introuvable côté serveur.'
+        });
+      }
+
+      // 5. Initialisation du client d'administration Supabase
+      const supabaseAdmin = createClient(SUPABASE_URL, serviceRoleKey, {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false
+        }
+      });
+
+      // 6. Mise à jour du mot de passe pour cet utilisateur vérifié UNIQUEMENT
+      const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(verifiedUserId, {
+        password: newPassword
+      });
+
+      if (updateError) {
+        console.warn('Erreur mise à jour mot de passe admin Supabase:', updateError.message);
+        return res.status(400).json({
+          success: false,
+          error: updateError.message || 'Échec de la mise à jour du mot de passe.'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: 'Mot de passe mis à jour avec succès.'
+      });
+    } catch (err: any) {
+      console.error('Erreur inattendue /api/change-password:', err?.message);
+      return res.status(500).json({
+        success: false,
+        error: err?.message || 'Une erreur interne est survenue lors de la mise à jour du mot de passe.'
+      });
+    }
   });
 
   // Endpoint de déploiement sécurisé en mémoire
@@ -134,26 +239,27 @@ async function startServer() {
 
     let isFounderAuthorized = false;
 
-    // 1. Session administrateur direct certifiée (master session administrateur fondateur)
-    if (
-      sessionAccessToken === 'admin-authenticated-token' ||
-      sessionAccessToken.startsWith('admin-') ||
-      sessionAccessToken === 'artisanpro_admin_session'
-    ) {
-      isFounderAuthorized = true;
-    } else if (sessionAccessToken) {
-      // 2. Vérification cryptographique via JWT Supabase Auth si session distante active
+    if (sessionAccessToken) {
+      // Vérification cryptographique via JWT Supabase Auth et profiles.role
       try {
         const { data, error } = await supabaseAuthClient.auth.getUser(sessionAccessToken);
         if (!error && data?.user) {
-          const EXPECTED_FOUNDER_UID = '29a23578-640c-434c-bb7c-5b1cb7a30a91';
-          const isFounderUid = data.user.id === EXPECTED_FOUNDER_UID || data.user.id === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb';
-          const isFounderEmail = Boolean(
-            (data.user.email && data.user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
-            (data.user.user_metadata?.email && String(data.user.user_metadata.email).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
-          );
-          if (isFounderEmail || isFounderUid) {
+          const { data: prof } = await supabaseAuthClient
+            .from('profiles')
+            .select('role')
+            .eq('id', data.user.id)
+            .maybeSingle();
+
+          if (prof?.role === 'admin') {
             isFounderAuthorized = true;
+          } else {
+            const isFounderEmail = Boolean(
+              (data.user.email && data.user.email.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()) ||
+              (data.user.user_metadata?.email && String(data.user.user_metadata.email).toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim())
+            );
+            if (isFounderEmail) {
+              isFounderAuthorized = true;
+            }
           }
         }
       } catch (authErr) {
@@ -224,10 +330,11 @@ async function startServer() {
 
     isDeployingMutex = true;
 
-    // Déploiement successif de create-wallet-recharge puis verify-wallet-recharge
+    // Déploiement successif de create-wallet-recharge, verify-wallet-recharge et moniz-webhook
     // avec --use-api (sans Docker) et ciblant bdsllohfaslkkupwsvyi
     const cmdCreate = `npx supabase functions deploy create-wallet-recharge --project-ref ${targetProject} --use-api`;
     const cmdVerify = `npx supabase functions deploy verify-wallet-recharge --project-ref ${targetProject} --use-api`;
+    const cmdWebhook = `npx supabase functions deploy moniz-webhook --project-ref ${targetProject} --use-api`;
 
     // Fonction d'exécution sécurisée isolée
     const runDeploy = (cmd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
@@ -256,9 +363,13 @@ async function startServer() {
     try {
       const createResult = await runDeploy(cmdCreate);
       let verifyResult = { stdout: '', stderr: '', exitCode: 0 };
+      let webhookResult = { stdout: '', stderr: '', exitCode: 0 };
 
       if (createResult.exitCode === 0) {
         verifyResult = await runDeploy(cmdVerify);
+      }
+      if (createResult.exitCode === 0) {
+        webhookResult = await runDeploy(cmdWebhook);
       }
 
       // Effacer la variable locale de la mémoire
@@ -271,7 +382,8 @@ async function startServer() {
         projectRef: targetProject,
         results: {
           'create-wallet-recharge': createResult,
-          'verify-wallet-recharge': verifyResult
+          'verify-wallet-recharge': verifyResult,
+          'moniz-webhook': webhookResult
         }
       });
     } catch (err: any) {
@@ -287,11 +399,9 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // PERSISTENT STORAGE FOR NOTIFICATIONS & VERIFICATION DOSSIERS
+  // IN-MEMORY RUNTIME STORE (ZERO LOCAL FS FILE STORAGE)
+  // All permanent application data resides in Supabase (profiles, publications, etc.)
   // --------------------------------------------------------------------------
-  const DATA_DIR = path.join(__dirname, 'data');
-  const DATA_FILE = path.join(DATA_DIR, 'artisanpro_store.json');
-
   interface PersistentStore {
     notifications: any[];
     verifications: any[];
@@ -304,58 +414,31 @@ async function startServer() {
     conversations?: Record<string, any[]>;
   }
 
+  const inMemoryStore: PersistentStore = {
+    notifications: [],
+    verifications: [],
+    follows: [],
+    wallet_transactions: [],
+    wallets: {},
+    deleted_publications_ids: [],
+    deleted_artisans_ids: [],
+    chat_messages: {},
+    conversations: {}
+  };
+
   function getStore(): PersistentStore {
-    if (!fs.existsSync(DATA_DIR)) {
-      try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-    }
-    if (!fs.existsSync(DATA_FILE)) {
-      const initial: PersistentStore = { 
-        notifications: [], 
-        verifications: [], 
-        follows: [], 
-        wallet_transactions: [], 
-        wallets: {},
-        deleted_publications_ids: [],
-        deleted_artisans_ids: [],
-        chat_messages: {},
-        conversations: {}
-      };
-      try { fs.writeFileSync(DATA_FILE, JSON.stringify(initial, null, 2), 'utf-8'); } catch {}
-      return initial;
-    }
-    try {
-      const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (!parsed.follows) parsed.follows = [];
-      if (!parsed.wallet_transactions) parsed.wallet_transactions = [];
-      if (!parsed.wallets) parsed.wallets = {};
-      if (!parsed.deleted_publications_ids) parsed.deleted_publications_ids = [];
-      if (!parsed.deleted_artisans_ids) parsed.deleted_artisans_ids = [];
-      if (!parsed.chat_messages) parsed.chat_messages = {};
-      if (!parsed.conversations) parsed.conversations = {};
-      return parsed;
-    } catch {
-      return { 
-        notifications: [], 
-        verifications: [], 
-        follows: [], 
-        wallet_transactions: [], 
-        wallets: {},
-        deleted_publications_ids: [],
-        deleted_artisans_ids: [],
-        chat_messages: {},
-        conversations: {}
-      };
-    }
+    if (!inMemoryStore.follows) inMemoryStore.follows = [];
+    if (!inMemoryStore.wallet_transactions) inMemoryStore.wallet_transactions = [];
+    if (!inMemoryStore.wallets) inMemoryStore.wallets = {};
+    if (!inMemoryStore.deleted_publications_ids) inMemoryStore.deleted_publications_ids = [];
+    if (!inMemoryStore.deleted_artisans_ids) inMemoryStore.deleted_artisans_ids = [];
+    if (!inMemoryStore.chat_messages) inMemoryStore.chat_messages = {};
+    if (!inMemoryStore.conversations) inMemoryStore.conversations = {};
+    return inMemoryStore;
   }
 
   function saveStore(data: PersistentStore) {
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (e) {
-      console.warn('Failed to save store to file:', e);
-    }
+    Object.assign(inMemoryStore, data);
   }
 
   // Active SSE connections for Realtime notifications push
@@ -479,30 +562,25 @@ async function startServer() {
   async function isRequestAdmin(req: express.Request): Promise<boolean> {
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
-    const adminCode = req.headers['x-admin-code'] || req.headers['x-admin-secret'];
     
-    // 1. Session administrateur maître certifiée ou code fondateur 0707
-    if (
-      token === 'admin-authenticated-token' || 
-      token === 'artisanpro_admin_session' || 
-      token.startsWith('admin-') ||
-      adminCode === '0707'
-    ) {
-      return true;
-    }
-
-    // 2. Vérification cryptographique via JWT Supabase Auth
+    // Vérification cryptographique via session Supabase Auth (JWT) et profiles.role
     if (token && token.length > 20) {
       try {
         const { data, error } = await supabaseAuthClient.auth.getUser(token);
         if (!error && data?.user) {
-          const email = (data.user.email || '').toLowerCase().trim();
           const uid = data.user.id;
-          if (
-            email === ADMIN_EMAIL.toLowerCase() ||
-            uid === '29a23578-640c-434c-bb7c-5b1cb7a30a91' ||
-            uid === '1ab8700b-7fd9-4d76-a2c8-c02794ec11eb'
-          ) {
+          const { data: prof } = await supabaseAuthClient
+            .from('profiles')
+            .select('role')
+            .eq('id', uid)
+            .maybeSingle();
+
+          if (prof?.role === 'admin') {
+            return true;
+          }
+
+          const email = (data.user.email || '').toLowerCase().trim();
+          if (email === ADMIN_EMAIL.toLowerCase()) {
             return true;
           }
         }
@@ -513,41 +591,26 @@ async function startServer() {
   }
 
   // --------------------------------------------------------------------------
-  // STOCKAGE PRIVÉ ET SÉCURISÉ DES DOCUMENTS KYC D'IDENTITÉ
+  // STOCKAGE PRIVÉ ET SÉCURISÉ DES DOCUMENTS KYC (EN MÉMOIRE & SUPABASE STORAGE)
   // --------------------------------------------------------------------------
-  const KYC_STORAGE_DIR = path.join(DATA_DIR, 'kyc-documents');
-  if (!fs.existsSync(KYC_STORAGE_DIR)) {
-    try { fs.mkdirSync(KYC_STORAGE_DIR, { recursive: true }); } catch {}
-  }
-
   interface KycDocMetadata {
     id: string;
     userId: string;
     docType: string;
     fileName: string;
     mimeType: string;
-    filePath: string;
     createdAt: string;
   }
 
-  function getKycMetaFile(): string {
-    return path.join(DATA_DIR, 'kyc_meta.json');
-  }
+  const inMemoryKycDocs = new Map<string, { buffer: Buffer; meta: KycDocMetadata }>();
+  let inMemoryKycMeta: KycDocMetadata[] = [];
 
   function getKycMeta(): KycDocMetadata[] {
-    const mf = getKycMetaFile();
-    if (!fs.existsSync(mf)) return [];
-    try {
-      return JSON.parse(fs.readFileSync(mf, 'utf-8'));
-    } catch {
-      return [];
-    }
+    return inMemoryKycMeta;
   }
 
   function saveKycMeta(list: KycDocMetadata[]) {
-    try {
-      fs.writeFileSync(getKycMetaFile(), JSON.stringify(list, null, 2), 'utf-8');
-    } catch {}
+    inMemoryKycMeta = list;
   }
 
   // POST /api/storage/kyc-upload : Dépôt sécurisé des pièces justificatives
@@ -562,7 +625,7 @@ async function startServer() {
       let buffer: Buffer;
       let mimeType = 'image/jpeg';
       if (typeof fileData === 'string' && fileData.startsWith('data:')) {
-        const matches = fileData.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+        const matches = fileData.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
         if (matches && matches.length === 3) {
           mimeType = matches[1];
           buffer = Buffer.from(matches[2], 'base64');
@@ -576,12 +639,6 @@ async function startServer() {
       const docId = `kyc-${userId.substring(0, 8)}-${docType}-${Date.now()}`;
       const ext = mimeType.includes('png') ? 'png' : mimeType.includes('pdf') ? 'pdf' : 'jpg';
       const cleanFileName = `${docId}.${ext}`;
-      const userDir = path.join(KYC_STORAGE_DIR, userId.replace(/[^a-zA-Z0-9_-]/g, '_'));
-      if (!fs.existsSync(userDir)) {
-        fs.mkdirSync(userDir, { recursive: true });
-      }
-      const destPath = path.join(userDir, cleanFileName);
-      fs.writeFileSync(destPath, buffer);
 
       const meta: KycDocMetadata = {
         id: docId,
@@ -589,9 +646,10 @@ async function startServer() {
         docType,
         fileName: fileName || cleanFileName,
         mimeType,
-        filePath: destPath,
         createdAt: new Date().toISOString()
       };
+
+      inMemoryKycDocs.set(docId, { buffer, meta });
 
       const metaList = getKycMeta().filter(m => m.id !== docId);
       metaList.push(meta);
@@ -613,15 +671,16 @@ async function startServer() {
     }
   });
 
-  // GET /api/storage/kyc-document/:docId : Accès hautement sécurisé (Seuls le propriétaire ou l'administrateur peuvent lire)
+  // GET /api/storage/kyc-document/:docId : Accès hautement sécurisé
   app.get('/api/storage/kyc-document/:docId', async (req, res) => {
     const { docId } = req.params;
-    const metaList = getKycMeta();
-    const meta = metaList.find(m => m.id === docId);
+    const docItem = inMemoryKycDocs.get(docId);
 
-    if (!meta || !fs.existsSync(meta.filePath)) {
+    if (!docItem) {
       return res.status(404).json({ success: false, error: 'Document introuvable.' });
     }
+
+    const { buffer, meta } = docItem;
 
     // Contrôle d'accès strict : Est-ce l'administrateur ou le propriétaire du document ?
     const isAdmin = await isRequestAdmin(req);
@@ -645,20 +704,18 @@ async function startServer() {
     }
 
     if (!isAdmin && !isOwner) {
-      // Pour les balises <img> directes depuis l'interface client authentifiée
       const referer = req.headers.referer || '';
       if (!referer.includes('/admin') && !isOwner && !isAdmin) {
-        // En prévisualisation locale, autoriser si l'en-tête hôte correspond
         const isLocalHost = req.headers.host && (req.headers.host.includes('localhost') || req.headers.host.includes('.app'));
         if (!isLocalHost) {
-          return res.status(403).json({ success: false, error: 'Accès strictement restreint au propriétaire du document et à l\'administration.' });
+          return res.status(403).json({ success: false, error: 'Accès strictement restreint.' });
         }
       }
     }
 
     res.setHeader('Content-Type', meta.mimeType || 'image/jpeg');
     res.setHeader('Cache-Control', 'private, max-age=3600');
-    fs.createReadStream(meta.filePath).pipe(res);
+    res.send(buffer);
   });
 
   // GET /api/verifications (Admin only)
@@ -888,8 +945,25 @@ async function startServer() {
   // --------------------------------------------------------------------------
   app.post('/api/wallet/create-recharge', async (req, res) => {
     try {
-      const { amount_fcfa, phone_number, customer_name, payment_method, user_id } = req.body;
-      const amount = Math.round(Number(amount_fcfa) || 0);
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session utilisateur requise. En-tête Authorization manquant.'
+        });
+      }
+      const token = authHeader.substring(7).trim();
+      const { data: authData, error: authErr } = await supabaseAuthClient.auth.getUser(token).catch(() => ({ data: { user: null }, error: true }));
+      if (!authData?.user || authErr) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session invalide ou expirée. Authentification requise.'
+        });
+      }
+      const uid = authData.user.id;
+
+      const { amount_fcfa, amount: rawAmount, description, success_url, return_url, phone_number } = req.body;
+      const amount = Math.round(Number(amount_fcfa || rawAmount) || 0);
 
       if (!amount || amount < 200) {
         return res.status(400).json({
@@ -897,10 +971,65 @@ async function startServer() {
           error: 'Montant de recharge invalide. Le montant minimum est de 200 FCFA.'
         });
       }
+      const apiKey = process.env.GENIUSPAY_API_KEY || '';
+      const apiSecret = process.env.GENIUSPAY_API_SECRET || '';
+      const rawBaseUrl = process.env.GENIUSPAY_BASE_URL || 'https://sandbox.geniuspay.ci/api/v1/merchant';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const targetUrl = baseUrl.endsWith('/payments') ? baseUrl : `${baseUrl}/payments`;
 
-      const uid = user_id || 'me';
-      const cleanMethod = (payment_method || 'wave').toLowerCase().trim();
-      const merchantReference = `GP_REF_${Date.now()}_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+      if (!apiKey || !apiSecret) {
+        return res.status(500).json({
+          success: false,
+          error: 'Secrets GeniusPay (GENIUSPAY_API_KEY, GENIUSPAY_API_SECRET) non configurés.'
+        });
+      }
+
+      const requestPayload = {
+        amount: amount,
+        description: description || `Recharge portefeuille ArtisanPro - ${amount} FCFA`,
+        success_url: success_url || return_url || 'https://artisanpro.afrique/wallet?status=success'
+      };
+
+      const gpResponse = await fetch(targetUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-API-Key': apiKey,
+          'X-API-Secret': apiSecret
+        },
+        body: JSON.stringify(requestPayload)
+      });
+
+      if (!gpResponse.ok) {
+        const errText = await gpResponse.text();
+        let errJson: any = null;
+        try { errJson = JSON.parse(errText); } catch {}
+        return res.status(gpResponse.status).json({
+          success: false,
+          error: errJson?.error || errJson?.message || errText || `Erreur GeniusPay (${gpResponse.status})`
+        });
+      }
+
+      const gpData = await gpResponse.json();
+      const checkoutUrl = gpData.checkout_url || gpData.data?.checkout_url || gpData.payment_url || gpData.data?.payment_url || '';
+
+      if (!checkoutUrl) {
+        return res.status(400).json({
+          success: false,
+          error: gpData.error || gpData.message || 'Le champ checkout_url est absent de la réponse GeniusPay.'
+        });
+      }
+
+      const geniuspayReference = String(
+        gpData.reference ||
+        gpData.data?.reference ||
+        gpData.id ||
+        gpData.data?.id ||
+        gpData.transaction_id ||
+        gpData.data?.transaction_id ||
+        ''
+      );
 
       const store = getStore();
       if (!store.wallet_transactions) store.wallet_transactions = [];
@@ -911,17 +1040,15 @@ async function startServer() {
         amount_fcfa: amount,
         status: 'pending',
         provider: 'geniuspay',
-        payment_method: cleanMethod,
         phone: phone_number || '',
-        reference: merchantReference,
-        customer_name: customer_name || 'Utilisateur',
+        reference: geniuspayReference,
+        provider_ref: geniuspayReference,
         created_at: new Date().toISOString()
       };
 
       store.wallet_transactions.unshift(txRecord);
       saveStore(store);
 
-      // Enregistrement également dans Supabase wallet_transactions si disponible
       try {
         await supabaseAuthClient.from('wallet_transactions').insert({
           user_id: uid,
@@ -929,19 +1056,18 @@ async function startServer() {
           status: 'pending',
           provider: 'geniuspay',
           phone: phone_number || null,
-          reference: merchantReference,
+          reference: geniuspayReference || null,
+          provider_ref: geniuspayReference || null,
           created_at: new Date().toISOString()
         });
       } catch {}
 
-      // URL de paiement officiel GeniusPay
-      const checkoutUrl = `https://checkout.geniuspay.ci/pay?ref=${merchantReference}&amount=${amount}&currency=XOF&method=${cleanMethod}`;
-
       res.json({
         success: true,
-        reference: merchantReference,
+        reference: geniuspayReference,
         checkout_url: checkoutUrl,
-        amount_fcfa: amount
+        amount_fcfa: amount,
+        status: 'pending'
       });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message || 'Erreur lors de la création de la recharge.' });
@@ -950,7 +1076,24 @@ async function startServer() {
 
   app.post('/api/wallet/verify-recharge', async (req, res) => {
     try {
-      const { reference, user_id } = req.body;
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session utilisateur requise. En-tête Authorization manquant.'
+        });
+      }
+      const token = authHeader.substring(7).trim();
+      const { data: authData, error: authErr } = await supabaseAuthClient.auth.getUser(token).catch(() => ({ data: { user: null }, error: true }));
+      if (!authData?.user || authErr) {
+        return res.status(401).json({
+          success: false,
+          error: 'Session invalide ou expirée. Authentification requise.'
+        });
+      }
+      const authenticatedUserId = authData.user.id;
+
+      const { reference } = req.body;
       if (!reference) {
         return res.status(400).json({ success: false, error: 'Référence de transaction requise.' });
       }
@@ -959,15 +1102,26 @@ async function startServer() {
       if (!store.wallet_transactions) store.wallet_transactions = [];
       if (!store.wallets) store.wallets = {};
 
-      const tx = store.wallet_transactions.find(t => t.reference === reference);
-      const uid = user_id || (tx && tx.user_id) || 'me';
-
+      const tx = store.wallet_transactions.find(t => t.reference === reference || t.provider_ref === reference);
       if (!tx) {
         return res.status(404).json({ success: false, error: 'Transaction introuvable.' });
       }
 
+      // Sécurité stricte : Seul le propriétaire authentifié ou l'administrateur peut vérifier la transaction
+      const isOwner = authenticatedUserId === tx.user_id;
+      const isAdmin = (authData.user.email || '').toLowerCase() === ADMIN_EMAIL.toLowerCase();
+      if (!isOwner && !isAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'Accès interdit : vous ne pouvez pas vérifier la transaction d\'un autre compte.'
+        });
+      }
+
+      const uid = tx.user_id;
+
       const amount = Number(tx.amount_fcfa || tx.amount) || 0;
 
+      // Idempotence : si déjà complétée, ne pas recréditer
       if (tx.status === 'completed') {
         return res.json({
           success: true,
@@ -978,12 +1132,91 @@ async function startServer() {
         });
       }
 
+      // Vérification auprès de GeniusPay
+      const apiKey = process.env.GENIUSPAY_API_KEY || '';
+      const apiSecret = process.env.GENIUSPAY_API_SECRET || '';
+      const rawBaseUrl = process.env.GENIUSPAY_BASE_URL || 'https://sandbox.geniuspay.ci/api/v1/merchant';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const queryRef = tx.provider_ref || tx.reference || reference;
+      const endpointUrl = baseUrl.endsWith('/payments')
+        ? `${baseUrl}/${encodeURIComponent(queryRef)}`
+        : `${baseUrl}/payments/${encodeURIComponent(queryRef)}`;
+
+      let gpData: any = null;
+      let isNotFound = false;
+
+      if (apiKey && apiSecret) {
+        try {
+          const gpRes = await fetch(endpointUrl, {
+            method: 'GET',
+            headers: {
+              'Accept': 'application/json',
+              'X-API-Key': apiKey,
+              'X-API-Secret': apiSecret
+            }
+          });
+
+          if (gpRes.ok) {
+            gpData = await gpRes.json();
+            if (
+              gpData?.code === 'TRANSACTION_NOT_FOUND' ||
+              gpData?.error === 'TRANSACTION_NOT_FOUND' ||
+              gpData?.status === 'TRANSACTION_NOT_FOUND' ||
+              gpData?.data?.status === 'TRANSACTION_NOT_FOUND'
+            ) {
+              isNotFound = true;
+            }
+          } else {
+            const errText = await gpRes.text();
+            let errJson: any = null;
+            try { errJson = JSON.parse(errText); } catch {}
+            if (
+              errText.includes('TRANSACTION_NOT_FOUND') ||
+              errJson?.code === 'TRANSACTION_NOT_FOUND' ||
+              errJson?.error === 'TRANSACTION_NOT_FOUND' ||
+              errJson?.message === 'TRANSACTION_NOT_FOUND' ||
+              (errJson?.message && String(errJson.message).toUpperCase().includes('NOT_FOUND')) ||
+              gpRes.status === 404
+            ) {
+              isNotFound = true;
+            }
+          }
+        } catch (netErr) {
+          console.warn('GeniusPay verify network note:', netErr);
+        }
+      }
+
+      // En sandbox, si verify-wallet-recharge reçoit TRANSACTION_NOT_FOUND, laisse le statut pending.
+      if (isNotFound) {
+        return res.json({
+          success: false,
+          status: 'pending',
+          is_paid: false,
+          message: 'Transaction en cours (TRANSACTION_NOT_FOUND). Statut maintenu en pending.',
+          reference
+        });
+      }
+
+      const paymentPayload = gpData?.data || gpData;
+      const gpStatus = String(paymentPayload?.status || '').toLowerCase().trim();
+      const isCompleted = gpStatus === 'completed';
+
+      if (!isCompleted) {
+        return res.json({
+          success: false,
+          status: gpStatus || 'pending',
+          is_paid: false,
+          message: 'Paiement non finalisé auprès de GeniusPay. Statut maintenu en pending.',
+          reference
+        });
+      }
+
+      // Validation et crédit
       tx.status = 'completed';
       tx.confirmed_at = new Date().toISOString();
       store.wallets[uid] = (store.wallets[uid] || 0) + amount;
       saveStore(store);
 
-      // Mise à jour de solde en base Supabase
       try {
         const { data: profRow } = await supabaseAuthClient.from('profiles').select('wallet_balance').eq('id', uid).maybeSingle();
         if (profRow) {
@@ -1002,18 +1235,16 @@ async function startServer() {
         }
       } catch {}
 
-      // Notification de confirmation de recharge
       const rechargeNotif = {
         id: `notif-rec-${Date.now()}`,
         user_id: uid,
         title: 'Recharge GeniusPay validée ✅',
-        message: `Votre portefeuille a été crédité de ${amount.toLocaleString('fr-FR')} FCFA via GeniusPay (${tx.payment_method?.toUpperCase() || 'Mobile Money'}).`,
+        message: `Votre portefeuille a été crédité de ${amount.toLocaleString('fr-FR')} FCFA via GeniusPay.`,
         type: 'wallet',
         target_page: 'wallet',
         created_at: new Date().toISOString(),
         is_read: false
       };
-
       store.notifications.unshift(rechargeNotif);
       saveStore(store);
       broadcastRealtime('notification', rechargeNotif);
@@ -1029,6 +1260,137 @@ async function startServer() {
       res.status(500).json({ success: false, error: err.message || 'Erreur lors de la vérification de la recharge.' });
     }
   });
+
+  // --------------------------------------------------------------------------
+  // WEBHOOK MONIZ / GENIUSPAY (AVEC VÉRIFICATION STRICTE HMAC-SHA256)
+  // --------------------------------------------------------------------------
+  const handleMonizWebhook = async (req: express.Request, res: express.Response) => {
+    try {
+      const webhookSecret = 
+        process.env.MONIZ_WEBHOOK_SECRET || 
+        process.env.GENIUSPAY_WEBHOOK_SECRET || 
+        process.env.GENIUSPAY_API_SECRET || 
+        '';
+
+      if (!webhookSecret) {
+        console.error('Webhook secret non configuré');
+        return res.status(500).json({ error: 'Secret de webhook non configuré.' });
+      }
+
+      const signature = String(
+        req.headers['x-moniz-signature'] ||
+        req.headers['x-signature'] ||
+        req.headers['x-geniuspay-signature'] ||
+        req.headers['x-hub-signature-256'] ||
+        ''
+      ).trim().toLowerCase().replace(/^sha256=/, '');
+
+      const rawBody = (req as any).rawBody || JSON.stringify(req.body);
+      const computedHash = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(rawBody)
+        .digest('hex')
+        .toLowerCase();
+
+      // Vérification HMAC-SHA256 stricte avant de créditer
+      if (!signature || signature !== computedHash) {
+        console.warn('Rejet webhook : signature HMAC-SHA256 invalide');
+        return res.status(401).json({ error: 'Signature HMAC-SHA256 invalide ou manquante.' });
+      }
+
+      const payload = req.body || {};
+      const dataObj = payload.data || payload;
+      const reference = String(
+        dataObj.reference ||
+        dataObj.transaction_id ||
+        dataObj.id ||
+        payload.reference ||
+        payload.transaction_id ||
+        ''
+      ).trim();
+
+      if (!reference) {
+        return res.status(400).json({ error: 'Référence manquante dans le webhook.' });
+      }
+
+      const status = String(dataObj.status || payload.status || payload.event || '').toLowerCase().trim();
+      const isSuccessful = 
+        status === 'completed' || 
+        status === 'successful' || 
+        status === 'success' || 
+        status === 'paid' ||
+        status === 'payment.completed' ||
+        status === 'charge.completed';
+
+      const store = getStore();
+      if (!store.wallet_transactions) store.wallet_transactions = [];
+      if (!store.wallets) store.wallets = {};
+
+      const tx = store.wallet_transactions.find(t => t.reference === reference || t.provider_ref === reference);
+
+      // Une seule fois par référence (Idempotence)
+      if (tx && tx.status === 'completed') {
+        return res.json({
+          success: true,
+          already_processed: true,
+          message: 'Webhook déjà traité pour cette référence.',
+          reference
+        });
+      }
+
+      if (!isSuccessful) {
+        if (tx) {
+          tx.status = status || 'failed';
+          saveStore(store);
+        }
+        return res.json({
+          success: true,
+          credited: false,
+          status,
+          message: 'Statut mis à jour sans crédit.',
+          reference
+        });
+      }
+
+      // Crédit une seule fois par référence
+      const uid = tx?.user_id || dataObj.user_id || 'me';
+      const creditAmount = Number(tx?.amount_fcfa || dataObj.amount || payload.amount || 0);
+
+      if (tx) {
+        tx.status = 'completed';
+        tx.confirmed_at = new Date().toISOString();
+      }
+      store.wallets[uid] = (store.wallets[uid] || 0) + creditAmount;
+      saveStore(store);
+
+      try {
+        await supabaseAuthClient
+          .from('wallet_transactions')
+          .update({ status: 'completed', confirmed_at: new Date().toISOString() })
+          .or(`reference.eq.${reference},provider_ref.eq.${reference}`);
+
+        const { data: profRow } = await supabaseAuthClient.from('profiles').select('wallet_balance').eq('id', uid).maybeSingle();
+        if (profRow) {
+          await supabaseAuthClient.from('profiles').update({
+            wallet_balance: (Number(profRow.wallet_balance) || 0) + creditAmount
+          }).eq('id', uid);
+        }
+      } catch {}
+
+      res.json({
+        success: true,
+        credited: true,
+        amount_fcfa: creditAmount,
+        new_balance: store.wallets[uid],
+        reference
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Erreur interne du webhook' });
+    }
+  };
+
+  app.post('/api/wallet/moniz-webhook', handleMonizWebhook);
+  app.post('/api/moniz-webhook', handleMonizWebhook);
 
   // --------------------------------------------------------------------------
   // SUIVI DE PAGE & COMPTEUR D'ABONNÉS (RÉEL ET PERSISTÉ MULTI-APPAREILS)

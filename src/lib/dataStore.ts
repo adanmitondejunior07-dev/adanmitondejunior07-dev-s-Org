@@ -393,6 +393,7 @@ class DataStoreService {
       try {
         const { data, error } = await supabase.from('publications').insert({
           id: generatedUuid,
+          user_id: pub.user_id || null,
           artisan_name: pub.artisan_name,
           artisan_avatar: pub.artisan_avatar || null,
           location: pub.location || null,
@@ -1414,6 +1415,7 @@ class DataStoreService {
     try {
       await supabase.from('publications').insert({
         id: videoUuid,
+        user_id: video.user_id || null,
         artisan_name: video.artisan_name,
         artisan_avatar: video.artisan_avatar || null,
         location: video.ville || 'Afrique',
@@ -2326,19 +2328,22 @@ class DataStoreService {
     try {
       // Get session if any
       const { data: sessionData } = await supabase.auth.getSession();
-      const token = sessionData?.session?.access_token || 'admin-authenticated-token';
+      const token = sessionData?.session?.access_token || '';
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
 
       const res = await fetch(`/api/verifications/${encodeURIComponent(requestId)}/review`, {
         method: 'PUT',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-          'x-admin-code': '0707'
-        },
+        headers,
         body: JSON.stringify({
           status,
           reason,
-          adminId: adminId || 'admin-adanmitondejunior07',
+          adminId: adminId,
           adminEmail: adminEmail || ADMIN_EMAIL
         })
       });

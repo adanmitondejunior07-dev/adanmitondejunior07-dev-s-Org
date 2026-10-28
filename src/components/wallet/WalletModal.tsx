@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { dataStore } from '../../lib/dataStore';
-import { supabase } from '../../lib/supabase';
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, formatFetchError } from '../../lib/supabase';
 import { UserWallet, WalletTransaction, PaymentProvider, TransactionType, Artisan } from '../../types';
 
 interface WalletModalProps {
@@ -138,21 +138,35 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
     };
     const paymentMethod = methodMap[depositProvider] || 'wave';
 
+    // 0. Récupération stricte de la session utilisateur Supabase
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !session.access_token) {
+      setIsProcessingDeposit(false);
+      setGeniusPayStatusMsg({
+        type: 'error',
+        text: 'Session utilisateur requise. En-tête Authorization manquant : veuillez vous connecter avec votre compte Supabase (email / mot de passe) pour recharger votre portefeuille.'
+      });
+      return;
+    }
+
     try {
       let checkoutUrl = '';
       let serverReference = '';
       let failureError = '';
 
-      // 1. Appel de la fonction Supabase Edge create-wallet-recharge avec capture propre d'erreur
+      // 1. Appel de la fonction Supabase Edge create-wallet-recharge avec en-têtes Authorization et apikey
       try {
         const { data, error } = await supabase.functions.invoke('create-wallet-recharge', {
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`,
+            'apikey': SUPABASE_ANON_KEY
+          },
           body: {
             amount_fcfa: depositAmount,
             phone_number: depositPhone,
             customer_name: profile?.full_name || 'Utilisateur',
             payment_method: paymentMethod,
-            return_url: window.location.href,
-            user_id: userId
+            return_url: window.location.href
           }
         });
 
@@ -175,38 +189,8 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
         failureError = edgeErr?.message || '';
       }
 
-      // 2. Repli serveur fiable et instantané si l'Edge Function distante a renvoyé une erreur non-2xx
-      if (!checkoutUrl || !serverReference) {
-        try {
-          const srvRes = await fetch('/api/wallet/create-recharge', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              amount_fcfa: depositAmount,
-              phone_number: depositPhone,
-              customer_name: profile?.full_name || 'Utilisateur',
-              payment_method: paymentMethod,
-              return_url: window.location.href,
-              user_id: userId
-            })
-          });
-
-          if (srvRes.ok) {
-            const srvJson = await srvRes.json();
-            if (srvJson.success && srvJson.checkout_url && srvJson.reference) {
-              checkoutUrl = String(srvJson.checkout_url).trim();
-              serverReference = String(srvJson.reference).trim();
-              failureError = '';
-            }
-          }
-        } catch (srvErr: any) {
-          console.warn('Fallback recharge note:', srvErr);
-        }
-      }
-
-      // 3. Enregistrement local et ouverture du guichet UNIQUEMENT si le serveur a validé l'intention
+      // 2. Traitement strict de la réponse Edge Function (aucun appel vers server.ts ou /api/...)
       if (checkoutUrl && serverReference) {
-        // Enregistre en local une seule fois avec la VRAIE référence marchand serveur
         await dataStore.initiateGeniusPayRecharge(
           userId,
           depositAmount,
@@ -215,14 +199,12 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
           profile?.full_name || 'Utilisateur'
         );
 
-        // ✅ Assure que le bouton "Vérifier" enverra la référence marchand officielle
         setGeniusPayPendingTx({
           reference: serverReference,
           amount: depositAmount,
           checkoutUrl: checkoutUrl
         });
 
-        // Ouvre immédiatement l'URL de paiement Wave / GeniusPay
         try {
           const opened = window.open(checkoutUrl, '_blank', 'noopener,noreferrer');
           if (!opened) {
@@ -236,12 +218,13 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
         });
         setDepositSuccessMsg(`Demande de recharge initiée (Réf: ${serverReference}). Statut: EN ATTENTE. Le portefeuille ne sera crédité qu'après confirmation.`);
       } else {
-        const cleanMsg = failureError && !failureError.includes('non-2xx')
-          ? failureError
-          : `Le moyen de paiement ${paymentMethod.toUpperCase()} est temporairement indisponible sur le réseau. Veuillez réessayer dans quelques instants.`;
+        const targetEndpoint = `${SUPABASE_URL}/functions/v1/create-wallet-recharge`;
+        const exactErrorMsg = failureError 
+          ? formatFetchError(failureError, targetEndpoint)
+          : formatFetchError(new Error('Réponse non valide de la fonction Edge'), targetEndpoint);
         setGeniusPayStatusMsg({
-          type: 'warning',
-          text: cleanMsg
+          type: 'error',
+          text: exactErrorMsg
         });
       }
 
@@ -261,6 +244,17 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
     setIsVerifyingGeniusPay(true);
     setGeniusPayStatusMsg(null);
 
+    // 0. Récupération stricte de la session utilisateur Supabase
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !session.access_token) {
+      setIsVerifyingGeniusPay(false);
+      setGeniusPayStatusMsg({
+        type: 'error',
+        text: 'Session utilisateur requise. En-tête Authorization manquant : veuillez vous connecter à votre compte Supabase pour vérifier cette transaction.'
+      });
+      return;
+    }
+
     try {
       let isVerified = false;
       let isAlreadyProcessed = false;
@@ -268,6 +262,10 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
 
       try {
         const { data, error } = await supabase.functions.invoke('verify-wallet-recharge', {
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`,
+            'apikey': SUPABASE_ANON_KEY
+          },
           body: { reference: ref }
         });
 
@@ -280,31 +278,11 @@ export const WalletModal: React.FC<WalletModalProps> = ({ isOpen, onClose, onOpe
             msg = data.message || `Paiement certifié par GeniusPay ! Portefeuille crédité de ${amount.toLocaleString('fr-FR')} FCFA.`;
           }
         }
-      } catch (edgeErr) {
+      } catch (edgeErr: any) {
         console.warn('Edge Function verify-wallet-recharge en mode vérification:', edgeErr);
-      }
-
-      // Repli serveur direct si Edge Function retourne non-2xx ou non vérifié
-      if (!isVerified && !isAlreadyProcessed) {
-        try {
-          const srvVerify = await fetch('/api/wallet/verify-recharge', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ reference: ref, user_id: userId })
-          });
-          if (srvVerify.ok) {
-            const vData = await srvVerify.json();
-            if (vData.success) {
-              if (vData.already_processed) {
-                isAlreadyProcessed = true;
-                msg = 'Transaction déjà traitée et créditée (verrou anti-double crédit actif).';
-              } else {
-                isVerified = true;
-                msg = `Paiement validé avec succès ! Portefeuille crédité de ${amount.toLocaleString('fr-FR')} FCFA.`;
-              }
-            }
-          }
-        } catch {}
+        if (!msg) {
+          msg = `Échec de vérification auprès de l'Edge Function : ${formatFetchError(edgeErr, `${SUPABASE_URL}/functions/v1/verify-wallet-recharge`)}`;
+        }
       }
 
       if (!msg) {

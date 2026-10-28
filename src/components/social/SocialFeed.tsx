@@ -21,7 +21,8 @@ import {
 import { Publication, CommentItem } from '../../types';
 import { dataStore } from '../../lib/dataStore';
 import { useAuth } from '../../context/AuthContext';
-import { ADMIN_EMAIL } from '../../lib/supabase';
+import { supabase, SUPABASE_URL, ADMIN_EMAIL, formatFetchError } from '../../lib/supabase';
+import { uploadPublicationMediaToSupabase } from '../../lib/storageHelper';
 import { copyToClipboard } from '../../lib/utils';
 import { compressImageFile } from '../../lib/mediaCompressor';
 import { HeroCarousel } from '../common/HeroCarousel';
@@ -31,25 +32,8 @@ import { PostText } from './PostText';
 export const SocialFeed: React.FC = () => {
   const { profile, user } = useAuth();
 
-  // 1. Initialisation instantanée depuis le cache local (0 ms de délai)
-  const [publications, setPublications] = useState<Publication[]>(() => {
-    try {
-      return dataStore.getCachedPublicationsSync(user?.id);
-    } catch {
-      return [];
-    }
-  });
-
-  // Afficher les blocs gris uniquement si AUCUNE publication n'est encore disponible
-  const [loading, setLoading] = useState<boolean>(() => {
-    try {
-      const cached = dataStore.getCachedPublicationsSync(user?.id);
-      return cached.length === 0;
-    } catch {
-      return true;
-    }
-  });
-
+  const [publications, setPublications] = useState<Publication[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
 
@@ -59,6 +43,7 @@ export const SocialFeed: React.FC = () => {
   // New Post state
   const [newContent, setNewContent] = useState('');
   const [newMediaUrl, setNewMediaUrl] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [newMediaType, setNewMediaType] = useState<'image' | 'video'>('image');
   const [isPosting, setIsPosting] = useState(false);
 
@@ -123,10 +108,64 @@ export const SocialFeed: React.FC = () => {
       setLoading(true);
     }
     try {
-      const pubs = await dataStore.getPublications(user?.id);
-      if (pubs && pubs.length > 0) {
-        setPublications(pubs);
+      // 1. Lire directement depuis Supabase la table 'publications'
+      const { data: supaPubs, error: pubError } = await supabase
+        .from('publications')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (pubError) {
+        throw pubError;
       }
+
+      // 2. Lire les mentions j'aime réelles depuis Supabase
+      const { data: likesData } = await supabase
+        .from('likes')
+        .select('post_id, user_id');
+
+      // 3. Lire les commentaires depuis Supabase
+      const { data: commentsData } = await supabase
+        .from('comments')
+        .select('post_id');
+
+      const likesCountMap = new Map<string, number>();
+      const userLikedSet = new Set<string>();
+      if (likesData) {
+        for (const l of likesData) {
+          if (l.post_id) {
+            likesCountMap.set(l.post_id, (likesCountMap.get(l.post_id) || 0) + 1);
+            if (user?.id && l.user_id === user.id) {
+              userLikedSet.add(l.post_id);
+            }
+          }
+        }
+      }
+
+      const commentsCountMap = new Map<string, number>();
+      if (commentsData) {
+        for (const c of commentsData) {
+          if (c.post_id) {
+            commentsCountMap.set(c.post_id, (commentsCountMap.get(c.post_id) || 0) + 1);
+          }
+        }
+      }
+
+      const formatted: Publication[] = (supaPubs || []).map((row: any) => ({
+        id: row.id,
+        user_id: row.user_id,
+        artisan_name: row.artisan_name || 'Artisan ArtisanPro',
+        artisan_avatar: row.artisan_avatar || null,
+        location: row.location || 'Afrique',
+        content: row.content || '',
+        media_url: row.media_url || null,
+        media_type: row.media_type || 'image',
+        created_at: row.created_at,
+        likes_count: likesCountMap.get(row.id) || 0,
+        comments_count: commentsCountMap.get(row.id) || 0,
+        is_liked_by_me: userLikedSet.has(row.id)
+      }));
+
+      setPublications(formatted);
       setLoadError(null);
       if (user?.id) {
         const follows = dataStore.getFollowedUsers(user.id);
@@ -135,9 +174,9 @@ export const SocialFeed: React.FC = () => {
         setFollowedAuthors(new Set());
       }
     } catch (e: any) {
-      console.warn('Erreur chargement fil social:', e);
+      console.warn('Erreur chargement publications Supabase:', e);
       if (publications.length === 0) {
-        setLoadError('Connexion lente ou indisponible. Vos données locales sont préservées.');
+        setLoadError(`Impossible de charger les publications depuis la base de données. ${formatFetchError(e, `${SUPABASE_URL}/rest/v1/publications`)}`);
       }
     } finally {
       setLoading(false);
@@ -145,68 +184,7 @@ export const SocialFeed: React.FC = () => {
   };
 
   useEffect(() => {
-    let cancelled = false;
-
-    // Délai de garde-fou de sécurité : garantit que le squelette gris ne reste jamais bloqué indéfiniment
-    const safetyTimer = setTimeout(() => {
-      if (!cancelled) {
-        setLoading(false);
-      }
-    }, 3500);
-
-    const executeFetch = async () => {
-      try {
-        const pubs = await dataStore.getPublications(user?.id);
-        if (cancelled) return;
-        if (pubs && pubs.length > 0) {
-          setPublications(pubs);
-        }
-        setLoadError(null);
-        if (user?.id) {
-          const follows = dataStore.getFollowedUsers(user.id);
-          setFollowedAuthors(new Set(follows));
-        } else {
-          setFollowedAuthors(new Set());
-        }
-      } catch (e: any) {
-        if (cancelled) return;
-        console.warn('Erreur chargement fil social:', e);
-        if (publications.length === 0) {
-          setLoadError('Connexion lente ou indisponible. Vos données locales sont préservées.');
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-          clearTimeout(safetyTimer);
-        }
-      }
-    };
-
-    executeFetch();
-
-    const handleProfileUpdated = (e: any) => {
-      const { userId, fullName, avatarUrl } = e.detail || {};
-      // Mise à jour ciblée UNIQUEMENT si le propriétaire du post est formellement identifié par son userId
-      if (userId && fullName) {
-        setPublications(prev => prev.map(p => {
-          if (p.user_id && p.user_id === userId) {
-            return {
-              ...p,
-              artisan_name: fullName,
-              artisan_avatar: avatarUrl || p.artisan_avatar
-            };
-          }
-          return p;
-        }));
-      }
-    };
-
-    window.addEventListener('artisanpro_profile_updated' as any, handleProfileUpdated);
-    return () => {
-      cancelled = true;
-      clearTimeout(safetyTimer);
-      window.removeEventListener('artisanpro_profile_updated' as any, handleProfileUpdated);
-    };
+    loadPosts();
   }, [user?.id]);
 
   const handleLike = async (postId: string) => {
@@ -224,28 +202,41 @@ export const SocialFeed: React.FC = () => {
     const nextLiked = !previousLiked;
     const nextCount = nextLiked ? previousCount + 1 : Math.max(0, previousCount - 1);
 
-    // 1. Mise à jour optimiste immédiate dans l'interface (0 ms d'attente)
+    // 1. Mise à jour optimiste immédiate dans l'interface
     setPublications(prev =>
       prev.map(p => (p.id === postId ? { ...p, is_liked_by_me: nextLiked, likes_count: nextCount } : p))
     );
 
     try {
-      // 2. Synchronisation et confirmation Supabase via dataStore
-      const res = await dataStore.toggleLike(postId, user.id);
-      setPublications(prev =>
-        prev.map(p => {
-          if (p.id === postId) {
-            return {
-              ...p,
-              is_liked_by_me: res.isLiked,
-              likes_count: res.count
-            };
-          }
-          return p;
-        })
-      );
+      // 2. Écriture / suppression directe dans la table 'likes' de Supabase
+      if (previousLiked) {
+        await supabase
+          .from('likes')
+          .delete()
+          .eq('post_id', postId)
+          .eq('user_id', user.id);
+      } else {
+        await supabase
+          .from('likes')
+          .insert({
+            post_id: postId,
+            user_id: user.id
+          });
+      }
+
+      // Relecture du compte exact depuis Supabase
+      const { count } = await supabase
+        .from('likes')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId);
+
+      if (typeof count === 'number') {
+        setPublications(prev =>
+          prev.map(p => (p.id === postId ? { ...p, likes_count: count } : p))
+        );
+      }
     } catch (err) {
-      // 3. Rollback en cas d'échec réseau
+      // Rollback en cas d'échec
       setPublications(prev =>
         prev.map(p => (p.id === postId ? { ...p, is_liked_by_me: previousLiked, likes_count: previousCount } : p))
       );
@@ -259,29 +250,53 @@ export const SocialFeed: React.FC = () => {
       return;
     }
     setActiveCommentsPostId(postId);
-    if (!commentsMap[postId]) {
-      const c = await dataStore.getComments(postId);
-      setCommentsMap(prev => ({ ...prev, [postId]: c }));
-    }
+    try {
+      const { data, error } = await supabase
+        .from('comments')
+        .select('*')
+        .eq('post_id', postId)
+        .order('created_at', { ascending: true });
+
+      if (!error && data) {
+        setCommentsMap(prev => ({ ...prev, [postId]: data }));
+      }
+    } catch {}
   };
 
   const handleSendComment = async (postId: string) => {
-    if (!newCommentText.trim()) return;
+    if (!newCommentText.trim() || !user) {
+      if (!user) showToast('Connectez-vous pour commenter');
+      return;
+    }
     setIsSendingComment(true);
 
     const userName = profile?.full_name || 'Utilisateur ArtisanPro';
-    const userId = user?.id || 'anon';
-
     try {
-      const added = await dataStore.addComment(postId, userId, userName, newCommentText.trim());
-      setCommentsMap(prev => ({
-        ...prev,
-        [postId]: [...(prev[postId] || []), added]
-      }));
-      setPublications(prev =>
-        prev.map(p => p.id === postId ? { ...p, comments_count: (p.comments_count || 0) + 1 } : p)
-      );
-      setNewCommentText('');
+      const { data: newCmt, error } = await supabase
+        .from('comments')
+        .insert({
+          post_id: postId,
+          user_id: user.id,
+          user_name: userName,
+          comment_text: newCommentText.trim()
+        })
+        .select()
+        .single();
+
+      if (!error && newCmt) {
+        setCommentsMap(prev => ({
+          ...prev,
+          [postId]: [...(prev[postId] || []), newCmt]
+        }));
+        setPublications(prev =>
+          prev.map(p => p.id === postId ? { ...p, comments_count: (p.comments_count || 0) + 1 } : p)
+        );
+        setNewCommentText('');
+      } else {
+        showToast('Erreur lors de l\'envoi du commentaire');
+      }
+    } catch (err) {
+      showToast('Erreur lors de l\'envoi du commentaire');
     } finally {
       setIsSendingComment(false);
     }
@@ -338,6 +353,7 @@ export const SocialFeed: React.FC = () => {
   const [editingPost, setEditingPost] = useState<Publication | null>(null);
   const [editContent, setEditContent] = useState('');
   const [editMediaUrl, setEditMediaUrl] = useState('');
+  const [editSelectedFile, setEditSelectedFile] = useState<File | null>(null);
   const [editMediaType, setEditMediaType] = useState<'image' | 'video'>('image');
   const [isUpdatingPost, setIsUpdatingPost] = useState(false);
   const editFileInputRef = useRef<HTMLInputElement>(null);
@@ -355,6 +371,7 @@ export const SocialFeed: React.FC = () => {
     setEditingPost(pub);
     setEditContent(pub.content || '');
     setEditMediaUrl(pub.media_url || '');
+    setEditSelectedFile(null);
     setEditMediaType((pub.media_type as 'image' | 'video') || 'image');
   };
 
@@ -363,43 +380,64 @@ export const SocialFeed: React.FC = () => {
     if (!editingPost || !editContent.trim()) return;
     setIsUpdatingPost(true);
     try {
-      const updated = await dataStore.updatePublication(editingPost.id, {
-        content: editContent.trim(),
-        media_url: editMediaUrl.trim() || null,
-        media_type: editMediaType
-      });
-      if (updated) {
-        setPublications(prev => prev.map(p => p.id === editingPost.id ? { ...p, ...updated } : p));
-        showToast('Publication modifiée avec succès !');
-        setEditingPost(null);
+      let finalUrl = editMediaUrl.trim() || null;
+      if (editSelectedFile && user?.id) {
+        finalUrl = await uploadPublicationMediaToSupabase(editSelectedFile, user.id, editMediaType);
       }
+
+      const { error } = await supabase
+        .from('publications')
+        .update({
+          content: editContent.trim(),
+          media_url: finalUrl,
+          media_type: editMediaType
+        })
+        .eq('id', editingPost.id);
+
+      if (error) {
+        throw error;
+      }
+
+      // Relire depuis Supabase après modification
+      await loadPosts();
+      showToast('Publication modifiée avec succès !');
+      setEditingPost(null);
+      setEditSelectedFile(null);
+    } catch (err) {
+      console.error('Error updating publication:', err);
+      showToast('Erreur lors de la modification de la publication');
     } finally {
       setIsUpdatingPost(false);
     }
   };
 
-  const handleEditMediaFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleEditMediaFilePicked = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const isVideo = file.type.startsWith('video/');
     setEditMediaType(isVideo ? 'video' : 'image');
+    setEditSelectedFile(file);
 
-    const dataUrl = await compressImageFile(file, 1200, 0.82);
-    if (dataUrl) {
-      setEditMediaUrl(dataUrl);
-      showToast(isVideo ? 'Nouvelle vidéo sélectionnée !' : 'Nouvelle photo sélectionnée !');
-    }
+    const previewUrl = URL.createObjectURL(file);
+    setEditMediaUrl(previewUrl);
+    showToast(isVideo ? 'Nouvelle vidéo sélectionnée !' : 'Nouvelle photo sélectionnée !');
     e.target.value = '';
   };
 
   const handleDeletePublication = async (pubId: string) => {
     if (!window.confirm('Voulez-vous vraiment supprimer cette publication ?')) return;
     try {
-      await dataStore.deletePublication(pubId);
-      setPublications(prev => prev.filter(p => p.id !== pubId));
+      // Vrai delete sur Supabase
+      const { error } = await supabase.from('publications').delete().eq('id', pubId);
+      if (error) {
+        console.warn('Supabase delete error:', error);
+      }
+      // Rechargement immédiat depuis Supabase
+      await loadPosts();
       showToast('Publication supprimée avec succès !');
     } catch (err) {
       console.error('Error deleting publication:', err);
+      showToast('Erreur lors de la suppression de la publication');
     }
   };
 
@@ -411,18 +449,17 @@ export const SocialFeed: React.FC = () => {
     { label: 'Mécanique', url: 'https://images.unsplash.com/photo-1619642751034-765dfdf7c58e?auto=format&fit=crop&w=600&q=80', type: 'image' as const }
   ];
 
-  const handleMediaFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMediaFilePicked = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     const isVideo = file.type.startsWith('video/');
     setNewMediaType(isVideo ? 'video' : 'image');
+    setSelectedFile(file);
 
-    const dataUrl = await compressImageFile(file, 1200, 0.82);
-    if (dataUrl) {
-      setNewMediaUrl(dataUrl);
-      showToast(isVideo ? 'Vidéo sélectionnée depuis votre galerie !' : 'Photo sélectionnée depuis votre galerie !');
-    }
+    const previewUrl = URL.createObjectURL(file);
+    setNewMediaUrl(previewUrl);
+    showToast(isVideo ? 'Vidéo prête pour Supabase Storage !' : 'Photo prête pour Supabase Storage !');
     e.target.value = '';
   };
 
@@ -430,9 +467,8 @@ export const SocialFeed: React.FC = () => {
     e.preventDefault();
     if (!newContent.trim()) return;
 
-    if (user?.id && dataStore.isUserSuspended(user.id)) {
-      const reason = dataStore.getSuspensionReason(user.id);
-      alert(`Votre compte a été suspendu (${reason}). Impossible de publier.`);
+    if (!user) {
+      showToast('Connectez-vous pour publier');
       return;
     }
 
@@ -441,21 +477,45 @@ export const SocialFeed: React.FC = () => {
     const location = profile?.ville ? `${profile.ville}, ${profile.pays || 'Afrique'}` : 'Afrique';
 
     try {
-      const created = await dataStore.createPublication({
-        artisan_name: authorName,
-        artisan_avatar: profile?.avatar_url || null,
-        location: location,
-        content: newContent.trim(),
-        media_url: newMediaUrl.trim() || null,
-        media_type: newMediaType,
-        user_id: user?.id
-      });
+      let finalMediaUrl: string | null = null;
+      if (selectedFile) {
+        // Envoi direct dans Supabase Storage
+        finalMediaUrl = await uploadPublicationMediaToSupabase(selectedFile, user.id, newMediaType);
+      } else if (newMediaUrl && !newMediaUrl.startsWith('blob:')) {
+        finalMediaUrl = newMediaUrl.trim();
+      }
 
-      setPublications(prev => [created, ...prev]);
+      // Vrai insert dans la table 'publications' de Supabase
+      const generatedUuid = crypto.randomUUID();
+      const { error: insError } = await supabase
+        .from('publications')
+        .insert({
+          id: generatedUuid,
+          user_id: user.id,
+          artisan_name: authorName,
+          artisan_avatar: profile?.avatar_url || null,
+          location: location,
+          content: newContent.trim(),
+          media_url: finalMediaUrl,
+          media_type: newMediaType,
+          created_at: new Date().toISOString()
+        });
+
+      if (insError) {
+        throw insError;
+      }
+
+      // Rechargement immédiat depuis Supabase
+      await loadPosts();
+
       setShowCreateModal(false);
       setNewContent('');
       setNewMediaUrl('');
+      setSelectedFile(null);
       showToast('Publication partagée avec succès !');
+    } catch (err: any) {
+      console.error('Erreur création publication:', err);
+      showToast('Erreur lors de la publication sur le serveur');
     } finally {
       setIsPosting(false);
     }

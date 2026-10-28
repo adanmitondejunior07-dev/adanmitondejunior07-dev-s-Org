@@ -1,11 +1,70 @@
 import { createClient } from '@supabase/supabase-js';
 import { safeSupabaseStorage } from './supabaseStorage';
 
-export const SUPABASE_URL = 
-  import.meta.env.VITE_SUPABASE_URL || 'https://bdsllohfaslkkupwsvyi.supabase.co';
+const cleanEnv = (val: string | undefined, defaultVal: string): string => {
+  const raw = val || defaultVal;
+  return raw
+    .replace(/[\r\n\t]/g, '')
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .trim()
+    .replace(/\/+$/, '');
+};
 
-export const SUPABASE_ANON_KEY = 
-  import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_5ZZiR7VTlZN16JTonMTQDA_ei7saoDO';
+export const SUPABASE_URL = cleanEnv(
+  import.meta.env.VITE_SUPABASE_URL,
+  'https://bdsllohfaslkkupwsvyi.supabase.co'
+);
+
+export const SUPABASE_ANON_KEY = cleanEnv(
+  import.meta.env.VITE_SUPABASE_ANON_KEY,
+  'sb_publishable_5ZZiR7VTlZN16JTonMTQDA_ei7saoDO'
+);
+
+/**
+ * Formate une erreur réseau / fetch avec nom, message, cause et adresse exacte,
+ * sans aucune clé API ou jeton sensible.
+ */
+export function formatFetchError(err: unknown, targetUrl?: string): string {
+  const errorObj = err as any;
+  const name = errorObj?.name || (err instanceof Error ? err.constructor.name : 'Error');
+  const message = errorObj?.message || (typeof err === 'string' ? err : 'Erreur réseau inconnue');
+
+  let causeStr: string | null = null;
+  if (errorObj?.cause) {
+    if (typeof errorObj.cause === 'string') {
+      causeStr = errorObj.cause;
+    } else if (errorObj.cause?.message) {
+      causeStr = String(errorObj.cause.message);
+    } else {
+      try {
+        causeStr = JSON.stringify(errorObj.cause);
+      } catch {
+        causeStr = String(errorObj.cause);
+      }
+    }
+  }
+
+  // Nettoyer l'URL cible de toute clé ou jeton d'authentification par sécurité absolue
+  let cleanTarget = targetUrl;
+  if (cleanTarget) {
+    cleanTarget = cleanTarget
+      .replace(/([?&])apikey=[^&]*/gi, '$1')
+      .replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer ***')
+      .replace(/\?&/g, '?')
+      .replace(/[?&]$/, '');
+  }
+
+  const parts: string[] = [`[${name}] ${message}`];
+  if (causeStr && causeStr !== 'undefined') {
+    parts.push(`Cause: ${causeStr}`);
+  }
+  if (cleanTarget) {
+    parts.push(`Adresse: ${cleanTarget}`);
+  }
+
+  return parts.join(' | ');
+}
 
 export const ADMIN_EMAIL = 'adanmitondejunior07@gmail.com';
 

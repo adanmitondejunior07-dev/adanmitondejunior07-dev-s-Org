@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, Eye, EyeOff, CheckCircle, AlertCircle, Hammer, ArrowLeft, ShieldCheck } from 'lucide-react';
-import { supabase } from '../../lib/supabase';
+import { supabase, SUPABASE_URL, formatFetchError } from '../../lib/supabase';
 import { router } from '../../lib/router';
 
 interface NewPasswordViewProps {
@@ -27,8 +27,8 @@ export const NewPasswordView: React.FC<NewPasswordViewProps> = ({ onSuccess }) =
       return;
     }
 
-    if (password.length < 6) {
-      setErrorMessage('Le mot de passe doit comporter au moins 6 caractères.');
+    if (password.length < 8) {
+      setErrorMessage('Le mot de passe doit comporter au moins 8 caractères.');
       return;
     }
 
@@ -39,28 +39,77 @@ export const NewPasswordView: React.FC<NewPasswordViewProps> = ({ onSuccess }) =
 
     setIsLoading(true);
 
+    let succeeded = false;
+
+    // 1. Essaie d'abord l'appel direct supabase.auth.updateUser
     try {
       const { error } = await supabase.auth.updateUser({ password: password });
-
-      if (error) {
-        setErrorMessage(error.message || 'Impossible de mettre à jour le mot de passe.');
-        setIsLoading(false);
+      if (!error) {
+        succeeded = true;
       } else {
-        setSuccessMessage('Mot de passe changé !');
-        setIsLoading(false);
+        console.warn('supabase.auth.updateUser a échoué, bascule automatique sur /api/change-password:', error.message);
+      }
+    } catch (directErr: any) {
+      console.warn('supabase.auth.updateUser exception direct, bascule automatique sur /api/change-password:', directErr?.message);
+    }
 
-        if (onSuccess) {
-          onSuccess();
+    // 2. Si ça échoue, bascule automatiquement sur /api/change-password
+    if (!succeeded) {
+      try {
+        const { data: sessData } = await supabase.auth.getSession();
+        let accessToken = sessData?.session?.access_token || '';
+
+        // Si le token n'est pas encore dans la session locale, vérifier les fragments d'URL (lien magique / récupération)
+        if (!accessToken) {
+          const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+          const searchParams = new URLSearchParams(window.location.search);
+          accessToken = hashParams.get('access_token') || searchParams.get('access_token') || '';
         }
 
-        // Redirige vers /login après succès
-        setTimeout(() => {
-          router.push('/login');
-        }, 1200);
+        if (!accessToken) {
+          setErrorMessage('Session requise. Veuillez vous connecter ou utiliser le lien reçu par e-mail.');
+          setIsLoading(false);
+          return;
+        }
+
+        const res = await fetch('/api/change-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`
+          },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (res.ok && data?.success) {
+          succeeded = true;
+        } else {
+          const cleanMsg = data?.error || 'Impossible de mettre à jour le mot de passe.';
+          setErrorMessage(cleanMsg);
+          setIsLoading(false);
+          return;
+        }
+      } catch (apiErr: any) {
+        setErrorMessage(formatFetchError(apiErr, '/api/change-password'));
+        setIsLoading(false);
+        return;
       }
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Une erreur est survenue.');
+    }
+
+    if (succeeded) {
+      setSuccessMessage('Mot de passe changé avec succès !');
       setIsLoading(false);
+
+      if (onSuccess) {
+        onSuccess();
+      }
+
+      // Redirige vers /login après succès
+      setTimeout(() => {
+        router.push('/login');
+      }, 1500);
     }
   };
 
@@ -144,7 +193,7 @@ export const NewPasswordView: React.FC<NewPasswordViewProps> = ({ onSuccess }) =
                     setPassword(e.target.value);
                     setErrorMessage('');
                   }}
-                  placeholder="Minimum 6 caractères"
+                  placeholder="Minimum 8 caractères"
                   className="w-full pl-10 pr-11 py-3 rounded-2xl border border-neutral-300 text-sm focus:outline-hidden focus:border-[#FF6B1A] focus:ring-2 focus:ring-[#FF6B1A]/20 transition-all bg-neutral-50/40"
                 />
                 <button
