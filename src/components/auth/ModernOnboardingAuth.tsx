@@ -24,7 +24,8 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { MetierSelectionModal } from './MetierSelectionModal';
-import { PAYS_AFRIQUE } from '../../lib/supabase';
+import { PAYS_AFRIQUE, SUPABASE_URL, formatFetchError } from '../../lib/supabase';
+import { router } from '../../lib/router';
 
 interface ModernOnboardingAuthProps {
   onNavigateToVerify?: (email: string) => void;
@@ -170,9 +171,13 @@ export const ModernOnboardingAuth: React.FC<ModernOnboardingAuthProps> = ({
         setErrorMessage(res.error);
       } else {
         setSuccessMessage('Connexion réussie !');
+        // Rediriger immédiatement vers l'accueil de l'application
+        setTimeout(() => {
+          router.push('/');
+        }, 400);
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Erreur lors de la connexion.');
+      setErrorMessage(formatFetchError(err, `${SUPABASE_URL}/auth/v1/token`));
     } finally {
       setIsSubmitting(false);
     }

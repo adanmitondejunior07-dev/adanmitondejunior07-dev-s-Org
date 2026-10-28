@@ -230,7 +230,7 @@ const MainApp: React.FC = () => {
   }
 
   // 6. /login ROUTE: Direct login view
-  if (currentPath === '/login') {
+  if (currentPath === '/login' && !user) {
     return (
       <WelcomeScreen
         initialShowLogin={true}

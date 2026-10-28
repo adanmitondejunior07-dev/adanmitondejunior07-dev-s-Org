@@ -15,8 +15,18 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || 'https://bdsllohfaslkkupwsvyi.supabase.co';
-const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_5ZZiR7VTlZN16JTonMTQDA_ei7saoDO';
+const cleanEnv = (val: string | undefined, defaultVal: string = ''): string => {
+  const raw = val || defaultVal;
+  return raw
+    .replace(/[\r\n\t]/g, '')
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .trim()
+    .replace(/\/+$/, '');
+};
+
+const SUPABASE_URL = cleanEnv(process.env.VITE_SUPABASE_URL, 'https://bdsllohfaslkkupwsvyi.supabase.co');
+const SUPABASE_ANON_KEY = cleanEnv(process.env.VITE_SUPABASE_ANON_KEY, 'sb_publishable_5ZZiR7VTlZN16JTonMTQDA_ei7saoDO');
 const ADMIN_EMAIL = 'adanmitondejunior07@gmail.com';
 
 const supabaseAuthClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -140,11 +150,7 @@ async function startServer() {
       const verifiedUserId = userData.user.id;
 
       // 4. Lecture de la clé service_role uniquement depuis les Secrets / variables d'environnement côté serveur
-      const serviceRoleKey = (
-        process.env.SUPABASE_SERVICE_ROLE_KEY || 
-        process.env.SERVICE_ROLE_KEY || 
-        ''
-      ).trim().replace(/^["']+|["']+$/g, '');
+      const serviceRoleKey = cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE_KEY);
 
       if (!serviceRoleKey) {
         console.error('[SECURITE] Clé service_role manquante côté serveur (SUPABASE_SERVICE_ROLE_KEY)');
@@ -185,6 +191,20 @@ async function startServer() {
         success: false,
         error: err?.message || 'Une erreur interne est survenue lors de la mise à jour du mot de passe.'
       });
+    }
+  });
+
+  // GET /sw.js : Service Worker de nettoyage servi directement sans cache
+  app.get('/sw.js', (_req, res) => {
+    res.setHeader('Content-Type', 'application/javascript');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    const swPath = path.join(__dirname, 'public', 'sw.js');
+    if (fs.existsSync(swPath)) {
+      res.sendFile(swPath);
+    } else {
+      res.status(200).send('self.addEventListener("install", () => self.skipWaiting());');
     }
   });
 
